@@ -1,0 +1,23 @@
+# conda env for front-detection training, pinned to the versions validated
+# locally (WSL2, 2026-08-09).  tensorflow[and-cuda] bundles its own CUDA 12.2
+# libraries -- no cluster CUDA module needed beyond a recent NVIDIA driver.
+#   conda env create -f slurm/fronts-tf-environment.yml
+name: fronts-tf
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - tensorflow[and-cuda]==2.15.1
+      - numpy==1.26.4
+      - xarray==2024.9.0
+      - netCDF4==1.7.4
+      - h5py==3.12.1
+      - pandas==2.2.2
+      - scipy==1.14.0
+      - scikit-learn==1.5.1
+      - matplotlib==3.9.1.post1
+      - PyYAML==6.0.3
+      - pykrige==1.7.3
+      - pytest

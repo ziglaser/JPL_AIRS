@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jul 21 15:16:26 2026
+
+@author: markr
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+
+import zach_data_loader as zdl
+import zach_models as zm
+
+# code these to be wherever yours are
+fs = np.array([
+    Path('../data/FCST_SMAP_MRMS_2016_T20260330205337.nc'),
+    Path('../data/FCST_SMAP_MRMS_2017_T20260330205608.nc'),
+    Path('../data/FCST_SMAP_MRMS_2018_T20260330210506.nc'),
+    Path('../data/FCST_SMAP_MRMS_2019_T20260330211356.nc'),
+    Path('../data/FCST_SMAP_MRMS_2020_T20260330211635.nc'),
+    Path('../data/FCST_SMAP_MRMS_2021_T20260330215842.nc')
+       ],
+)
+
+# Load dataset of properties
+ds_samples = zdl.eg_load_samples(fs)
+# include the soil moisture at overpass time, i.e. moisture before anything
+# happens. This avoids time interpolation smoothing precip back onto
+# soil moisture.
+ds_samples['SMAP_smsfc_av0'] = ds_samples['SMAP_smsfc_av'].isel(time=0)
+
+
+# example trained random forest, play with the parameters and vairables
+# etc to change predictors, methods etc. This one just takes the 6-hour
+# series of CAPE and CIN and hour-0 soil moisture to try and predict
+# the 6-hour progression of precip at that location.
+
+# you can rewrite this to do e.g. hour-by-hour
+
+X_keys = ['FCST_MU_CAPE', 'FCST_MU_CIN', 'SMAP_smsfc_av0']
+Y_keys = ['MRMS_GaugeCorrQPE01H_gridav']
+
+rfr = zm.train_random_forest(
+    ds_samples, X_keys, Y_keys, train_fraction=0.25,
+    rfr_kwargs = {'max_depth': 14, 'n_estimators': 75},
+)
+
+# predict the test Y values
+Ypred = rfr['model'].predict(rfr['X_test'])
+Ytest = rfr['Y_test']
+
+
+
+pred_cdf = zm.make_binned_freqs(Ypred.max(axis=1), Ytest.max(axis=1), 99.5 )
+
+kws = {
+   'xlabel' : 'Percentile',
+   'ylabel' : 'CDF',
+}
+fig,ax = plt.subplots(1,1,subplot_kw=kws)
+ax.plot(pred_cdf)
+
+
+
+
+# redo with hour-by-hour
+
+rfr_hourly = zm.train_random_forest(
+    ds_samples, X_keys, Y_keys, train_fraction=0.25,hourly=True,
+    rfr_kwargs = {'max_depth': 14, 'n_estimators': 75},
+)
+
+
+# predict the test Y values
+Ypred_hourly = rfr_hourly['model'].predict(rfr_hourly['X_test'])
+Ytest_hourly = rfr_hourly['Y_test']
+Xtest_hourly = rfr_hourly['X_test']
+
+
+# 99.9th percentile of hourly using random forest with CAPE, CIN, smsfc_av
+pred_cdf_hourly = zm.make_binned_freqs(
+    Ypred_hourly,Ytest_hourly,  99.9
+)
+# 99.9th percentile of hourly using CAPE only. 0th element of X is CAPE.
+cape_only = zm.make_binned_freqs(
+    Xtest_hourly[:,0], Ytest_hourly, 99.9
+)
+
+kws = {
+   'xlabel' : 'Percentile',
+   'ylabel' : 'CDF',
+}
+fig,ax = plt.subplots(1,1,subplot_kw=kws)
+ax.plot(cape_only,label='CAPE only')
+ax.plot(pred_cdf_hourly,label='RFR with CAPE, CIN, smsfc0')
+
+ax.legend()

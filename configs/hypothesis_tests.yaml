@@ -1,0 +1,70 @@
+# =============================================================================
+# HYPOTHESIS-TEST CONFIG — everything that governs the tests, run on the table
+# defined by the data-table config (data_table.yaml).
+#
+# This file is the full battery with every knob written out and documented;
+# hypothesis_topline_p99.yaml is a minimal example. Unlisted keys fall back to
+# the pre-registered defaults in convection_skill/config.py. A comparison spec
+# also works here: a `defaults:` mapping + a `runs:` list, one suite per run
+# over the same data table.
+#
+# Run:  PYTHONPATH=src python src/run_suite.py configs/data_table.yaml configs/hypothesis_tests.yaml
+# =============================================================================
+name: ""
+
+# ---- event definitions --------------------------------------------------------
+# Thresholds are always computed from the UNSCREENED base sample (the paper's
+# "thresholds are based on all data"), then applied as absolute cuts — so runs
+# with different screens share identical event definitions.
+heavy_percentile: 99.9        # THE QPE percentile the Gini "heavy" events use
+heavy_sens_percentile: 99.95  # sensitivity target (the paper's headline)
+any_precip_mm: 0.1            # "any precip" bar (mm/h), also the onset target
+max_percentile: 99.9          # sub-pixel MRMS _max target (S3)
+sk_percentile: 99.0           # _sk-among-precipitating target (S3)
+
+# ---- event screens --------------------------------------------------------------
+# Post-rain screens: drop rows AFTER rain has fallen in the cell, so an SM
+# "signal" can't be a consequence of the morning's rain (the row-deletion
+# complement of the pflux_prewindow conditioning control).
+screen_overpass_rain: true    # drop the whole cell-day if it rained at overpass
+screen_forecast_rain: true    # drop slots after the first in-window rain
+rain_screen_mm: 0.1           # the "already rained" bar (mm/h)
+convective_min: null          # e.g. 0.2 keeps only convective events; null = all
+convective_col: convective_share  # or convective_frac (cell coverage)
+
+# ---- which hypotheses -----------------------------------------------------------
+# all      = every registered spec (incl. inversion/robustness variants)
+# topline  = the primary spec per row of the hypothesis table
+# or an explicit list of registry ids, e.g. [A1_mu, T1T2_sign]
+hypotheses: all
+
+# ---- stratification (what stratifies what) ---------------------------------------
+# Stratifier names (defined in convection_skill/hypotheses.py STRATIFIERS):
+#   humidity   fcst_q terciles (q_dry / q_mid / q_moist)
+#   eastwest   split at lon -95 (Tuttle–Salvucci sign flip)
+#   aridity    cell-climatology SM terciles (arid / mid / humid_clim)
+#   wind       SMAP L4 wind-speed terciles (calm / breezy / windy)
+#   season     MAM / JJA / SON
+#   slot_phase early 21–23Z / late 00–02Z
+default_strata: [season, eastwest, slot_phase]  # applied to EVERY hypothesis
+strata: {}     # per-hypothesis override of the spec's own strata, e.g.
+               #   strata:
+               #     T1T2_sign: [eastwest, aridity, humidity]
+controls: {}   # per-hypothesis override of the conditional-Gini controls, e.g.
+               #   controls:
+               #     T1T2_sign: [mu_cape, pflux_prewindow]
+run_controls: true   # conditional Ginis within control bins
+run_strata: true     # per-stratum Ginis
+run_curves: true     # event-rate curves for curve specs (A2); true | false
+                     # | a list of ids to restrict further, e.g. [A2_cin]
+
+# ---- inference ---------------------------------------------------------------------
+inference: iid        # iid   = the paper's row bootstrap
+                      # block = 7-day day-block bootstrap (corrects the iid
+                      #         bootstrap's measured 2–3x overconfidence)
+n_boot_reps: 500
+block_days: 7         # block length when inference: block
+seed: 20260720
+fdr_alpha: 0.10       # BH-FDR battery-wide (Wilks 2016 "2x" rule)
+n_control_bins: 10        # conditional-Gini control bins
+min_events_per_bin: 20    # bins with fewer events are dropped

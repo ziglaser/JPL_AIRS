@@ -1,0 +1,3 @@
+[submodule "fronts"]
+	path = fronts
+	url = https://github.com/ai2es/fronts.git

@@ -1,0 +1,8 @@
+name: topline_p99
+
+hypotheses: topline
+heavy_percentile: 99.0
+
+# keep the battery's pre-registered post-rain screens
+screen_overpass_rain: true
+screen_forecast_rain: true

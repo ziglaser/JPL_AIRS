@@ -1,0 +1,29 @@
+name: ""
+
+# ---- temporal scope ---------------------------------------------------------
+years: [2016, 2017, 2018, 2019, 2020, 2021]
+months: [3, 11]            # inclusive window; the data season is Mar–Nov
+slots: [1, 2, 3, 4, 5, 6]  # forecast hours 21–02 UTC (slot 0 = AIRS overpass)
+
+# ---- geographic scope ---------------------------------------------------------
+lat_range: [32.0, 53.0]
+lon_range: [-107.0, -64.0]
+land_fraction_min: 0.5     # 0.0 keeps ocean cells
+
+# ---- product validity ----------------------------------------------------------
+# Which products must be finite in a kept row; any subset of
+# [airs, airs_fcst, smap, mrms]. Event thresholds always come from the
+# UNSCREENED base sample, so validity choices never move event definitions.
+valid_datasets: [airs, airs_fcst, smap, mrms]
+require_complete_days: true  # Mark's completeness: CAPE/CIN/QPE valid at ALL 7 hours
+
+# ---- Mark's sample screens (email 2026-07-21; verbatim code in mark_screens.py)
+screen_altitude: true      # lowest parcel < alt_max_m at ALL 7 hours
+alt_max_m: 1000.0
+screen_dry_start: true     # grid-mean QPE <= dry_start_mm at hours 0 AND 1
+dry_start_mm: 0.001
+
+# ---- sample unit -------------------------------------------------------------
+# "cell_day": Prepared also carries the Mark-style one-row-per-cell-day table
+# (slot variables widened to <var>_h<slot>); "slot" = individual rows only.
+sample_unit: cell_day

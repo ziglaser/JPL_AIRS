@@ -1,0 +1,141 @@
+# =============================================================================
+# DL-FRONT TUNABLES — every knob that can change without touching code.
+#
+# Paper = Biard & Kunkel (2019), Adv. Stat. Clim. Meteorol. Oceanogr. 5,
+# 147-160 (docs/papers/Biard_Kunkel_2019.pdf); section references are to it.
+# The values below ARE the paper replication; edit a copy and point
+# JPL_DLFRONT_CONFIG at it to run an experiment without disturbing these
+# tracked defaults:
+#
+#   JPL_DLFRONT_CONFIG=configs/my_experiment.yaml \
+#       PYTHONPATH=src python -m dl_front.train --name X5 --classes 5
+#
+# Structural constants (grid geometry, variable/class names, file paths,
+# label-overlap priority) stay in src/dl_front/config.py — changing those
+# requires matching data or code changes.  The reader
+# (dl_front.config.load_tunables) rejects unknown or missing keys, so typos
+# fail loudly at import.
+# =============================================================================
+
+model:
+  n_conv_layers: 3      # section 3.1: three conv+ReLU+dropout layers before the
+                        # softmax head (layer count was hyperparameter-searched)
+  n_filters: 80         # "5x5 kernel and 80 filters", layers 1..n_conv_layers
+  kernel_size: 5        # "5x5 kernel" (all layers, head included)
+  dropout: 0.5          # "50% 2-D dropout layer" (spatial dropout: whole
+                        # feature maps zeroed, as the paper describes)
+
+loss:
+  none_weight: 0.35     # section 3.1: "setting the category weight for the
+                        # none category to 0.35 and the other weights to 1.0"
+
+training:
+  learning_rate: 1.0e-4 # "The final learning rate chosen was 0.0001" (Adam);
+                        # 5e-5..5e-4 performed near-identically per the paper
+  batch_size: 32        # NOT stated in the paper; 32 chosen for the GTX 1070
+                        # (decision 2026-08-09); raise to 128-256 on an A100
+  max_epochs: 600       # paper trained "for 1200 epochs" (folds stopped at
+                        # 1136-1142 under the patience rule below); halved to
+                        # 600 for GTX 1070 wall-clock (decision 2026-08-10)
+  patience: 100         # "Training stopped when the loss did not improve for
+                        # 100 epochs" (early stopping on val_loss)
+  n_folds: 3            # section 4.1: 3-fold cross-validation, each fold
+                        # trains on 2/3 of the samples
+  fold_seed: 20260809   # seed for the fold permutation AND tf.data shuffling
+
+# Stage-B/C curriculum (not in the paper; front_finder workplan 3.6 ratios).
+stages:
+  degraded_lr_factor: 0.5    # stage B (AIRS simulator) LR = factor * learning_rate
+  finetune_lr_factor: 0.2    # stage C (real AIRS) LR = factor * learning_rate
+  finetune_patience: 15      # stage C early-stopping patience (small corpus)
+  severity_ramp_epochs: 10   # stage B: epochs to ramp degradation 0 -> 1
+
+labels:
+  label_width: 3        # section 3.3: "transverse extent of 3 deg"; 1wide
+                        # raster files also exist for both label sources
+
+splits:
+  # Section 4.1: trained on 2003-2007 (3-fold CV), evaluated on 2008-2015.
+  train_years_5class: [2003, 2004, 2005, 2006, 2007]
+  eval_years_5class: [2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015]
+  # Dryline variant (decision 2026-08-12): ALL training stages (clean,
+  # kriged-degraded, kriged-AIRS fine-tune) use 2007-2015 with 3-fold CV per
+  # phase, and the years below are the common held-out test period scored by
+  # dl_front.evaluate_test.  NOAA labels start 2007 after the 2026-08-11
+  # reorg; 2015 is the last year with sfc_daily reanalysis on disk.
+  train_years_6class: [2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015]
+  # User decision 2026-08-13: BK19 published predictions end 2018, so the
+  # three-way test (ours-on-reanalysis / ours-on-kriged-AIRS / BK19) uses
+  # identical years for consistency.
+  eval_years_6class: [2016, 2017, 2018]
+
+# Stage-B "AIRS simulator" degradation of the T2M/QV2M channels only
+# (winds/SLP come from forecast fields on the JPL laptop, so they stay clean).
+degradation:
+  t2m_noise_sigma_k: 1.7       # near-surface AIRS T error (Divakarla et al.
+                               # 2006: RMS 1.5-2 K in the lowest 2 km)
+  q2m_noise_frac_sigma: 0.20   # near-surface AIRS q error (~20-25 %),
+                               # mean-preserving lognormal
+  observed_min_fraction: 0.5   # valid-fraction below which a pixel counts as
+                               # a retrieval gap; used by BOTH the on-the-fly
+                               # stage-B degradation (degrade_sfc) and the
+                               # kriged-cache builds (airs_fcst/krige_fill).
+                               # MUST equal
+                               # front_finder.ingest_hysplit.OBSERVED_MIN_FRACTION
+                               # (asserted in tests/test_dlfront_model.py)
+
+# AIRS-FCST period geometry (dl_front.airs_fcst / dl_front.krige_fill).
+airs:
+  # Label hours covered by one AIRS-FCST fullgrid file: the ~19Z overpass
+  # maps to the 18Z bulletin, the uniform forecast slots to 21Z and next-day
+  # 00Z (parceltime audit 2026-08-12).  Also the default evaluate_test hours
+  # filter, so reanalysis and kriged-AIRS scores use identical time steps.
+  hours: [18, 21, 0]
+  # Pressure level standing in for the 2-m/10-m surface fields.  The fullgrid
+  # level axis holds 30-hPa BIN CENTERS 115..1075 hPa; the bottom three bins
+  # (1015/1045/1075) are always empty and 985 hPa (~10% coverage over the
+  # swath) is the deepest real retrieval, so 985 is the target (fullgrid
+  # audit 2026-08-12).  Keep this on an actual bin center: a between-bin
+  # value such as 1000 averages the observed indicator with the empty
+  # 1015-hPa bin and caps valid_frac at 0.5 -- exactly the observed_min_
+  # fraction threshold -- collapsing coverage to ~0.9% of the grid.
+  surface_level_hpa: 985
+  # Channels gap-filled by kriging in the DEGRADED-reanalysis stage: the two
+  # AIRS-retrieved thermodynamic fields.  Winds/SLP stay clean reanalysis
+  # there (same rationale as the degradation section); build_airs kriges all
+  # four AIRS-derived channels regardless.
+  kriged_channels: [T2M, QV2M]
+  # Cells covered in at least this fraction of a cycle-day's composited
+  # overpasses count as inside the expected 16-day-repeat swath (Zach asked
+  # for the 5-10% band, 2026-08-13); below it a cell is out-of-swath and a
+  # missing in-swath cell is a retrieval/cloud gap (dl_front.swath).
+  swath_min_fraction: 0.075
+
+# Analysis domain of the 6-class dryline/AIRS track (user decision
+# 2026-08-13): ALL scoring -- training loss in stages B/C, every
+# evaluate_test leg (bk19 included), krige_validate metrics -- is restricted
+# to the box below intersected with land.  The old full codsus region mask
+# was "far too large" for the AIRS product; kriging/inputs extend past this
+# box only by the derived receptive-field halo (dl_front.dataset.halo_px).
+# The 5-class paper replication keeps the codsus region mask untouched.
+domain:
+  lat_range: [32.0, 53.0]      # degrees N, inclusive
+  lon_range: [-107.0, -64.0]   # degrees E, inclusive
+  land_fraction_min: 0.5       # cells with interpolated land fraction below
+                               # this are excluded from the analysis domain
+                               # (masks/land_surface_mask.nc, 'lsm')
+
+# Ordinary-kriging gap fill (dl_front.krige_fill; pykrige.ok.OrdinaryKriging).
+kriging:
+  variogram_model: linear   # pykrige default family; robust with no fitted
+                            # range/sill at 68x141 scale (decision 2026-08-12)
+  max_obs_points: 1500      # observed-pixel subsample cap: OK solves a dense
+                            # (n+1)^2 system, ~1500 keeps a step < a few s
+  seed: 20260812            # rng for the observed-pixel subsampling
+
+evaluation:
+  # Section 4.2.4 ROC/PR sweep: the none-category likelihood is scaled by
+  # each factor before the argmax; 0 labels everything front, the largest
+  # labels everything no-front.  These are the paper's Fig. 5 marker values.
+  roc_factors: [0.0, 0.062, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0,
+                32.0, 64.0, 256.0, 4096.0]

@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jul 21 15:21:43 2026
+
+@author: markr
+"""
+
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+
+import scipy.stats as s
+
+
+
+def train_random_forest(ds_samples, X_keys, Y_keys, hourly=False, 
+                        train_fraction=0.25, seed=42, rfr_kwargs=None):
+    """
+    Extracts features/targets from ds_samples and fits a Random Forest Regressor.
+    
+    Parameters:
+    - ds_samples: xr.Dataset stacked along 'sample' (and optionally 'time').
+    - X_keys: List of predictor variable names.
+    - Y_keys: Target variable name (str) or list of names.
+    - hourly: If True, reshapes data to predict hour-by-hour (N*hours, n_features).
+              If False, preserves all hours as separate feature columns (N, n_features*hours).
+    - train_fraction: Float for train/test split ratio.
+    - seed: Integer random seed for reproducibility.
+    - rfr_kwargs: Dict of arguments for RandomForestRegressor.
+    
+    Returns:
+    - Dict containing: 'model', 'X_train', 'X_test', 'Y_train', 'Y_test', 'X_keys', 'Y_keys', 'hourly'
+    """
+    if rfr_kwargs is None:
+        rfr_kwargs = {'max_depth': 12, 'n_estimators': 75}
+        
+    np.random.seed(seed)
+    
+    # Identify time dimension length if present in any 2D variable
+    n_hours = None
+    for k in X_keys + (Y_keys if isinstance(Y_keys, list) else [Y_keys]):
+        if 'time' in ds_samples[k].dims:
+            n_hours = ds_samples[k].sizes['time']
+            break
+
+    # -------------------------------------------------------------
+    # 1. Build Predictor Matrix X
+    # -------------------------------------------------------------
+    X_list = []
+    for var in X_keys:
+        da = ds_samples[var]
+        
+        if 'time' in da.dims:
+            arr = da.values.T  # Shape: (sample, time)
+            if hourly:
+                # Flatten across time -> (sample * time, 1)
+                arr = arr.ravel()[:, np.newaxis]
+        else:
+            arr = da.values  # Shape: (sample,)
+            if hourly and n_hours is not None:
+                # Duplicate static/initial variable for every hour of that sample
+                arr = np.repeat(arr, n_hours)[:, np.newaxis]
+            else:
+                arr = arr[:, np.newaxis]
+                
+        X_list.append(arr)
+        
+    X = np.hstack(X_list)
+
+    # -------------------------------------------------------------
+    # 2. Build Target Matrix/Vector Y
+    # -------------------------------------------------------------
+    if isinstance(Y_keys, str):
+        Y_keys = [Y_keys]
+        
+    Y_list = []
+    for var in Y_keys:
+        da = ds_samples[var]
+        if 'time' in da.dims:
+            arr = da.values.T
+            if hourly:
+                arr = arr.ravel()[:, np.newaxis]
+        else:
+            arr = da.values
+            if hourly and n_hours is not None:
+                arr = np.repeat(arr, n_hours)[:, np.newaxis]
+            else:
+                arr = arr[:, np.newaxis]
+        Y_list.append(arr)
+        
+    Y = np.hstack(Y_list)
+    
+    # Flatten single-target 2D array to 1D vector
+    if Y.shape[1] == 1:
+        Y = Y.ravel()
+
+    # -------------------------------------------------------------
+    # 3. Train / Test Split
+    # -------------------------------------------------------------
+    X_train, X_test, Y_train, Y_test = train_test_split(
+        X, Y, 
+        train_size=train_fraction, 
+        random_state=seed, 
+        shuffle=True
+    )
+
+    # -------------------------------------------------------------
+    # 4. Fit Random Forest
+    # -------------------------------------------------------------
+    print(f"Training RF [hourly={hourly}] on X shape {X_train.shape} -> Y shape {Y_train.shape}...")
+    rfr = RandomForestRegressor(random_state=seed, **rfr_kwargs)
+    rfr.fit(X_train, Y_train)
+
+    # -------------------------------------------------------------
+    # 5. Pack Results
+    # -------------------------------------------------------------
+    return {
+        'model': rfr,
+        'X_train': X_train,
+        'X_test': X_test,
+        'Y_train': Y_train,
+        'Y_test': Y_test,
+        'X_keys': X_keys,
+        'Y_keys': Y_keys,
+        'hourly': hourly
+    }
+
+
+# some quick functions to get scores, hists etc
+
+
+def make_binned_freqs(predY,obsY,obs_pct=99,thresh=None,cum=True,seed=1,
+                      bin_pcts=None):
+    np.random.seed(seed)
+    
+    if thresh is None:
+        thresh = np.percentile(obsY,obs_pct)
+    
+    if bin_pcts is None:
+        bin_pcts = np.arange(101)
+    
+    bins = np.percentile(predY,bin_pcts)
+    
+    # add small perturbations to get lower bins - they are often zero
+    # but need to be nonzero for this quick plot
+    if len(set(bins))!=len(bins):
+        eps = np.random.randn(len(predY)) * predY.std() * 1.e-12
+        predY = predY + eps
+    
+    bins = np.percentile(predY,bin_pcts)
+
+    binned_freqs = s.binned_statistic(predY,obsY>thresh,bins=bins)[0]
+    
+    if cum:
+        binned_freqs = np.cumsum(binned_freqs) / binned_freqs.sum()
+    
+    return binned_freqs
+
+

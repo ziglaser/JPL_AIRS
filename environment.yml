@@ -1,0 +1,31 @@
+# Conda environment for the AIRS-FCST CAPE -> QPE Gini replication.
+#
+# Reproduces the analysis of Richardson, Kahn & Kalmus (2024),
+# "Mesoscale air motion and thermodynamics predict heavy hourly U.S. precipitation",
+# Communications Earth & Environment 5:472. doi:10.1038/s43247-024-01614-1
+#
+# Create with:   conda env create -f environment.yml
+# Activate with: conda activate airs-fcst
+#
+# Versions are pinned to what the analysis was developed against so results are
+# reproducible. netcdf4 / h5netcdf are the NetCDF backends xarray needs to open
+# the data/FCST_SMAP_MRMS_*.nc files (the base anaconda env ships neither).
+name: airs-fcst
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy=1.26.*
+  - pandas=2.2.*
+  - xarray=2023.6.*
+  - scipy=1.13.*
+  - matplotlib=3.8.*
+  - cartopy=0.23.*       # CONUS projection + coast/state/border outlines for maps
+  - scikit-learn=1.5.*   # only used to cross-check gini == 2*AUC - 1 in tests
+  - netcdf4=1.7.*        # primary NetCDF backend for xarray
+  - h5netcdf=1.8.*       # fallback HDF5-based NetCDF backend
+  - pytest=7.4.*
+  - jupyter
+  - pip
+  - pip:
+      - pyarrow          # parquet writer for results/ tables
