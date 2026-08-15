@@ -47,6 +47,12 @@
 #   KRIGE_WORKERS      default 8 (matches dlfront_krige.sbatch cpus)
 #   FORCE=1            resubmit phases whose done-marker already exists
 #   DRY_RUN=1          print every sbatch/python command without executing
+#   QUICKLOOK=0        skip the spot-check PNG jobs (default on: after the
+#                      swath bank and each krige phase a dl_front.quicklook
+#                      job renders maps to
+#                      $JPL_AIRS_RESULTS/dl_front/quicklook/<product>/;
+#                      nothing downstream depends on them, so a quicklook
+#                      failure never blocks training)
 #
 # Idempotency: a train phase is skipped when
 #   $JPL_AIRS_RESULTS/dl_front/models/<name>/<name>_final.h5 exists;
@@ -103,6 +109,7 @@ WARM_START=${WARM_START:-}
 KRIGE_WORKERS=${KRIGE_WORKERS:-8}
 FORCE=${FORCE:-0}
 DRY_RUN=${DRY_RUN:-0}
+QUICKLOOK=${QUICKLOOK:-1}
 # phase-4 test years (user decision 2026-08-13): the BK19 published
 # predictions end 2018, so the three-way test uses identical 2016-2018 years
 # for every leg (matches configs/dl_front.yaml eval_years_6class)
@@ -113,6 +120,7 @@ MODELS=$JPL_AIRS_RESULTS/dl_front/models
 KRIGED_DEGRADED=$JPL_AIRS_DATA/front_id/degraded_reanalysis
 KRIGED_AIRS=$JPL_AIRS_DATA/front_id/kriged_airs_fcst
 SWATH_BANK=$JPL_AIRS_DATA/masks/swath_bank.npz
+QL_DIR=$JPL_AIRS_RESULTS/dl_front/quicklook
 mkdir -p logs "$JPL_AIRS_RESULTS/dl_front"
 MANIFEST=$JPL_AIRS_RESULTS/dl_front/chain_$(date +%Y%m%d_%H%M%S).txt
 {
@@ -189,6 +197,13 @@ skip_bank() {   # the bank npz itself is the done-marker
     [ "$FORCE" = 1 ] && return 1
     [ -e "$SWATH_BANK" ]
 }
+# A quicklook re-renders whenever its build phase (re)ran this submission
+# (deterministic sampling -> same filenames, overwrite is the refresh); it
+# is skipped only when the phase was skipped AND its PNGs already exist.
+skip_quicklook() {  # skip_quicklook <build-jid-or-empty> <png-dir>
+    [ -z "$1" ] || return 1                       # build ran -> re-render
+    compgen -G "$2/*.png" > /dev/null
+}
 # An eval CSV's filename encodes only ckpt+source, so its existence alone
 # cannot prove it is the run the three-way comparison needs: a manual
 # debugging run (--no-match, partial --years) writes the SAME stem.  Trust
@@ -256,13 +271,24 @@ submit() {  # submit <label> <gpu 0|1> <deps colon-joined> <sbatch script> <args
 
 # ---- local (no-SLURM) runner: same commands, sequential foreground -------- #
 run_local() {  # run_local <label> <module> <args...>
-    local label=$1
+    local label=$1 status=0
     shift
     note "RUN python -m $*   (log: logs/$label.log)"
     if [ "$DRY_RUN" != 1 ]; then
-        PYTHONPATH=src python -m "$@" > "logs/$label.log" 2>&1
+        # capture the status instead of relying on set -e: inside a function
+        # invoked in a `cmd || fallback` list (the non-fatal quicklook calls)
+        # errexit is suppressed, so an unguarded failure would fall through
+        # to `record` and return 0.  Returning the real status keeps set -e
+        # aborting the chain for every caller NOT in a || list (build/train
+        # phases) and lets quicklook callers downgrade it to a note.
+        PYTHONPATH=src python -m "$@" > "logs/$label.log" 2>&1 || status=$?
     fi
-    record "$label" local-done
+    if [ "$status" = 0 ]; then
+        record "$label" local-done
+    else
+        record "$label" "local-FAILED-exit$status"
+    fi
+    return "$status"
 }
 
 # the submitting shell needs the fronts-tf env whenever it runs python
@@ -303,6 +329,16 @@ if [ "$HAVE_SLURM" = 1 ]; then
             JSB=$SUBMIT_JID
         fi
     fi
+    # spot-check maps of whatever bank the run uses (skip when no bank was
+    # submitted and none exists on disk -- quicklook would just error)
+    if [ "$QUICKLOOK" = 1 ] && { [ -n "$JSB" ] || [ -e "$SWATH_BANK" ]; }; then
+        if skip_quicklook "$JSB" "$QL_DIR/swath_bank"; then
+            note "skip quicklook swath-bank (PNGs exist; a bank rebuild refreshes them)"
+        else
+            submit quicklook-swath-bank 0 "$JSB" \
+                   slurm/dlfront_quicklook.sbatch swath-bank
+        fi
+    fi
 
     J2A=""
     if skip_krige "$KRIGED_DEGRADED" 2007 2015; then
@@ -313,6 +349,14 @@ if [ "$HAVE_SLURM" = 1 ]; then
                ${KRIGE_FORCE[@]+"${KRIGE_FORCE[@]}"}
         J2A=$SUBMIT_JID
     fi
+    if [ "$QUICKLOOK" = 1 ]; then
+        if skip_quicklook "$J2A" "$QL_DIR/kriged-degraded"; then
+            note "skip quicklook kriged-degraded (PNGs exist; a 2a rebuild refreshes them)"
+        else
+            submit quicklook-kriged-degraded 0 "$J2A" \
+                   slurm/dlfront_quicklook.sbatch kriged-degraded --years 2007-2015
+        fi
+    fi
 
     J3A=""
     if skip_krige "$KRIGED_AIRS" 2007 2021; then
@@ -322,6 +366,14 @@ if [ "$HAVE_SLURM" = 1 ]; then
                build-airs --years 2007-2021 --workers "$KRIGE_WORKERS" \
                ${KRIGE_FORCE[@]+"${KRIGE_FORCE[@]}"}
         J3A=$SUBMIT_JID
+    fi
+    if [ "$QUICKLOOK" = 1 ]; then
+        if skip_quicklook "$J3A" "$QL_DIR/kriged-airs"; then
+            note "skip quicklook kriged-airs (PNGs exist; a 3a rebuild refreshes them)"
+        else
+            submit quicklook-kriged-airs 0 "$J3A" \
+                   slurm/dlfront_quicklook.sbatch kriged-airs --years 2007-2021
+        fi
     fi
 
     EVAL_JIDS=()   # every phase-4 eval submitted this run (compare-job deps)
@@ -416,26 +468,60 @@ else
         activate_env
     fi
 
+    BANK_RAN=""
     if [ "$WITH_SWATH_BANK" = 1 ]; then
         if skip_bank; then
             note "skip pre-swath-bank ($SWATH_BANK exists)"
         else
             run_local pre-swath-bank dl_front.swath build-bank --years 2007-2021
+            BANK_RAN=1
         fi
     fi
+    # spot-check quicklooks are non-fatal by design (|| note): a rendering
+    # failure must not abort the training chain under set -e
+    if [ "$QUICKLOOK" = 1 ] && { [ -n "$BANK_RAN" ] || [ -e "$SWATH_BANK" ]; }; then
+        if skip_quicklook "$BANK_RAN" "$QL_DIR/swath_bank"; then
+            note "skip quicklook swath-bank (PNGs exist)"
+        else
+            run_local quicklook-swath-bank dl_front.quicklook swath-bank \
+                || note "quicklook swath-bank FAILED (non-fatal, see log)"
+        fi
+    fi
+    K2A_RAN=""
     if skip_krige "$KRIGED_DEGRADED" 2007 2015; then
         note "skip phase2a (caches exist)"
     else
         run_local phase2a-krige-degraded dl_front.krige_fill \
             build-degraded --years 2007-2015 --workers "$KRIGE_WORKERS" \
             ${KRIGE_FORCE[@]+"${KRIGE_FORCE[@]}"}
+        K2A_RAN=1
     fi
+    if [ "$QUICKLOOK" = 1 ]; then
+        if skip_quicklook "$K2A_RAN" "$QL_DIR/kriged-degraded"; then
+            note "skip quicklook kriged-degraded (PNGs exist)"
+        else
+            run_local quicklook-kriged-degraded dl_front.quicklook \
+                kriged-degraded --years 2007-2015 \
+                || note "quicklook kriged-degraded FAILED (non-fatal, see log)"
+        fi
+    fi
+    K3A_RAN=""
     if skip_krige "$KRIGED_AIRS" 2007 2021; then
         note "skip phase3a (caches exist)"
     else
         run_local phase3a-krige-airs dl_front.krige_fill \
             build-airs --years 2007-2021 --workers "$KRIGE_WORKERS" \
             ${KRIGE_FORCE[@]+"${KRIGE_FORCE[@]}"}
+        K3A_RAN=1
+    fi
+    if [ "$QUICKLOOK" = 1 ]; then
+        if skip_quicklook "$K3A_RAN" "$QL_DIR/kriged-airs"; then
+            note "skip quicklook kriged-airs (PNGs exist)"
+        else
+            run_local quicklook-kriged-airs dl_front.quicklook \
+                kriged-airs --years 2007-2021 \
+                || note "quicklook kriged-airs FAILED (non-fatal, see log)"
+        fi
     fi
 
     NEW_EVALS=0   # evals run this pass (compare-job trigger)

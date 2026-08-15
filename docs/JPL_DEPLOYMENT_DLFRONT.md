@@ -192,6 +192,29 @@ variogram explicitly. If a model other than the default wins, swap
 `JPL_DLFRONT_CONFIG` at an experiment copy) *before* phases 2a/3a build the
 caches.
 
+### Spot-check quicklooks (automatic)
+
+The chain renders human-checkable PNGs of every CPU-built product
+(`QUICKLOOK=0` disables): after the swath-bank job, one map per period hour
+of all 16 cycle-day coverage frequencies with the footprint threshold drawn
+(`quicklook/swath_bank/`); after each krige phase, a handful of cache steps
+— all five kriged channels plus the gap_type decomposition, framed to the
+crop window with the analysis domain outlined
+(`quicklook/kriged-degraded/`, `quicklook/kriged-airs/`). Everything lands
+under `$JPL_AIRS_RESULTS/dl_front/quicklook/`. Sampling is deterministic
+(evenly spaced over the caches' pooled time axis), so a rebuild overwrites
+the same filenames. The jobs are leaves of the dependency graph — a
+quicklook failure never blocks training. **Eyeball them before the stage-B/C
+trainings get far**: wrong-looking swaths, an empty gap_type panel, or a
+mis-scaled channel is a cache-build problem caught in minutes instead of a
+bad loss curve caught next morning. Manual reruns:
+
+```bash
+PYTHONPATH=src python -m dl_front.quicklook swath-bank
+PYTHONPATH=src python -m dl_front.quicklook kriged-degraded --years 2007-2015
+PYTHONPATH=src python -m dl_front.quicklook kriged-airs --years 2007-2021 --n 8
+```
+
 ## 4. Expected wall-clock
 
 - **Training** (phases 1/2b/3b, per fold): ~2-3 h on an A100, ~10-16 h on a
