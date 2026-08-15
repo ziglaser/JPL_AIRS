@@ -55,7 +55,7 @@ def test_module_constants_come_from_yaml():
         value = getattr(config, const)
         assert not isinstance(value, list), f"{const} should be a tuple"
         assert isinstance(value, (numbers.Number, tuple, str)), const
-    assert config.MAX_EPOCHS == 600           # spot-check a train.py consumer
+    assert config.MAX_EPOCHS == 1200          # spot-check a train.py consumer
     assert config.LABEL_WIDTH == 3            # ...and a dataset.py consumer
 
 
