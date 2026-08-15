@@ -36,17 +36,20 @@ def thermo_channels(t: xr.DataArray, q: xr.DataArray,
     t [K], q [kg/kg], p_pa [Pa]; any matching dims.  Returns T, q, r, Td,
     theta_e, Tv, RH (names per ``config.THERMO_VARS``).
     """
+    # Argument orders/names follow the upstream ai2es/fronts master submodule
+    # (2026-08-14 signature migration: dewpoint gained T, mixing ratio and
+    # theta_e reordered, relative_humidity_from_dewpoint renamed).
     V = _variables()
-    td = xr.apply_ufunc(V.dewpoint_from_specific_humidity, p_pa, q)
-    r = xr.apply_ufunc(V.mixing_ratio_from_dewpoint, p_pa, td)
+    td = xr.apply_ufunc(V.dewpoint_from_specific_humidity, p_pa, t, q)
+    r = xr.apply_ufunc(V.mixing_ratio_from_dewpoint, td, p_pa)
     return xr.Dataset({
         "T": t,
         "q": q,
         "r": r,
         "Td": td,
-        "theta_e": xr.apply_ufunc(V.equivalent_potential_temperature, p_pa, t, td),
+        "theta_e": xr.apply_ufunc(V.equivalent_potential_temperature, t, td, p_pa),
         "Tv": xr.apply_ufunc(V.virtual_temperature_from_mixing_ratio, t, r),
-        "RH": xr.apply_ufunc(V.relative_humidity_from_dewpoint, t, td),
+        "RH": xr.apply_ufunc(V.relative_humidity, t, td),
     })
 
 
