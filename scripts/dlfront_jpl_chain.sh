@@ -41,6 +41,8 @@
 #                      override is rarely needed)
 #   CONDA_PREFIX_ROOT  conda install root       (default: $HOME/miniconda3)
 #   SBATCH_PARTITION / SBATCH_ACCOUNT / SBATCH_GRES  injected at submit time
+#   SBATCH_GPU_PARTITION  partition for GPU jobs only (train); CPU jobs
+#                      (krige/quicklook/eval/compare) keep SBATCH_PARTITION
 #   CLASSES            default 6
 #   FOLDS              default "0 1 2"
 #   WARM_START         optional existing stage-A .h5 to --retrain phase 1 from
@@ -255,7 +257,11 @@ submit() {  # submit <label> <gpu 0|1> <deps colon-joined> <sbatch script> <args
     # whose slurm defaults force --export=NONE (silent repo-local fallbacks
     # otherwise)
     local opts=(--export=ALL)
-    [ -n "${SBATCH_PARTITION:-}" ] && opts+=(-p "$SBATCH_PARTITION")
+    # GPU jobs prefer SBATCH_GPU_PARTITION when set (e.g. gpu vs the CPU
+    # default partition); everything else uses SBATCH_PARTITION as before.
+    local part=${SBATCH_PARTITION:-}
+    [ "$gpu" = 1 ] && [ -n "${SBATCH_GPU_PARTITION:-}" ] && part=$SBATCH_GPU_PARTITION
+    [ -n "$part" ] && opts+=(-p "$part")
     [ -n "${SBATCH_ACCOUNT:-}" ]   && opts+=(-A "$SBATCH_ACCOUNT")
     [ "$gpu" = 1 ] && [ -n "${SBATCH_GRES:-}" ] && opts+=(--gres "$SBATCH_GRES")
     [ -n "$deps" ] && opts+=("--dependency=afterok:$deps")

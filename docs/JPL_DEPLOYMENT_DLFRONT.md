@@ -90,6 +90,7 @@ node (e.g. `srun ls $JPL_AIRS_DATA`) before submitting the chain.
 | `JPL_BK19_DIR` | published BK19 prediction rasters (yearly `1deg_{w}wide/{freq}/merra2_merra2-1deg_*_{year}.nc`, 1980-2018); the default now resolves inside the data root on the cluster too, so override only for an out-of-tree archive | `$JPL_AIRS_DATA/front_id/predicted_fronts/bk19` |
 | `CONDA_PREFIX_ROOT` | conda install root | `$HOME/miniconda3` |
 | `SBATCH_PARTITION` / `SBATCH_ACCOUNT` / `SBATCH_GRES` | injected at submit time (`sbatch -p/-A/--gres`); leave unset to use cluster defaults | unset |
+| `SBATCH_GPU_PARTITION` | partition for the GPU (train) jobs only; CPU jobs (krige/quicklook/eval/compare) keep `SBATCH_PARTITION`/cluster default. gattaca2: set this to `gpu`, leave `SBATCH_PARTITION` unset (default `compute`) | unset |
 | `CLASSES` | label classes | `6` |
 | `FOLDS` | folds to run | `"0 1 2"` |
 | `WARM_START` | existing stage-A `.h5` to `--retrain` phase 1 from | unset |
@@ -117,7 +118,9 @@ ls $JPL_AIRS_DATA/front_id/reanalysis/MERRA2/sfc_daily
 cd $JPL_AIRS_REPO
 conda activate fronts-tf                         # phase 0 runs python here
 export JPL_AIRS_DATA=... JPL_AIRS_FCST=... JPL_AIRS_RESULTS=...
-export SBATCH_PARTITION=<gpu partition>          # if the cluster needs one
+export SBATCH_GPU_PARTITION=<gpu partition>      # GPU jobs only (gattaca2: gpu);
+                                                 # CPU jobs use SBATCH_PARTITION
+                                                 # or the cluster default
 DRY_RUN=1 bash scripts/dlfront_jpl_chain.sh      # inspect the plan first
 bash scripts/dlfront_jpl_chain.sh --with-acquire --with-swath-bank  # submit for real
 ```
