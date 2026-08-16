@@ -70,8 +70,8 @@ def test_perfect_prediction_and_output_files(tmp_path):
         years=[2016, 2017], hours=(18, 21, 0), out_dir=tmp_path / "out")
 
     csv = pd.read_csv(paths["csv"])
-    assert list(csv.columns) == ["front", "dilation", "km",
-                                 "csi", "pod", "far", "fb"]
+    assert list(csv.columns) == ["front", "dilation", "km", "csi",
+                                 "csi_lo", "csi_hi", "pod", "far", "fb"]
     assert paths["csv"].name == "modelA_kriged-airs.csv"
     cold0 = csv[(csv.front == "cold") & (csv.dilation == 0)]
     np.testing.assert_allclose(cold0["csi"].iloc[0], 1.0)
@@ -119,7 +119,7 @@ def test_scoring_mask_is_analysis_domain_for_6class():
 
 
 def test_hours_filter_reduces_sample_count():
-    """Default AIRS hours keep 3 of the 4 synthetic steps per year."""
+    """Default AIRS hours (21, 0) keep 2 of the 4 synthetic steps per year."""
     all_hours, airs = PerfectStub(), PerfectStub()
     evaluate_test.evaluate_ckpt(all_hours, [2016], N_CLASSES, "reanalysis",
                                 hours=(18, 21, 0, 12), stats=STATS,
@@ -128,7 +128,7 @@ def test_hours_filter_reduces_sample_count():
                                 hours=None, stats=STATS,   # -> AIRS_HOURS
                                 loader=make_loader())
     assert all_hours.n_predicted == 4
-    assert airs.n_predicted == 3
+    assert airs.n_predicted == 2
     assert airs.n_predicted < all_hours.n_predicted
 
 
@@ -172,7 +172,8 @@ def test_keras_model_end_to_end(tmp_path):
         pm, scores, ckpt=tmp_path / "tiny.h5", source="reanalysis",
         years=[2016], hours=(18, 21, 0), out_dir=tmp_path / "out")
     assert list(pd.read_csv(paths["csv"]).columns) == [
-        "front", "dilation", "km", "csi", "pod", "far", "fb"]
+        "front", "dilation", "km", "csi", "csi_lo", "csi_hi",
+        "pod", "far", "fb"]
 
 
 def test_match_source_intersects_time_steps(monkeypatch):
@@ -303,6 +304,7 @@ def test_years_default_comes_from_config():
 def leg_csv(out_dir, stem, rows):
     """rows: (front, dilation, km, csi) tuples -> a leg CSV like write_outputs'."""
     pd.DataFrame([{"front": f, "dilation": d, "km": km, "csi": csi,
+                   "csi_lo": csi, "csi_hi": csi,
                    "pod": csi, "far": 0.0, "fb": 1.0}
                   for f, d, km, csi in rows]).to_csv(
         out_dir / f"{stem}.csv", index=False)
@@ -314,21 +316,25 @@ def test_compare_pivots_legs(tmp_path):
              ("dryline", 1, 111.0, 0.10)])
     leg_csv(tmp_path, "bk19",
             [("cold", 0, 0.0, 0.25), ("cold", 1, 111.0, 0.40)])
+    run_json(tmp_path, "D6C-f0_kriged-airs", "a" * 40)   # same-sample legs:
+    run_json(tmp_path, "bk19", "a" * 40)                 # -> comparison.csv
     (tmp_path / "notes.csv").write_text("a,b\n1,2\n")   # ignored: not a leg
 
     table = evaluate_test.compare(out_dir=tmp_path)
-    assert list(table.columns) == ["D6C-f0_kriged-airs", "bk19"]
+    assert list(table.columns) == [
+        "D6C-f0_kriged-airs", "D6C-f0_kriged-airs_lo", "D6C-f0_kriged-airs_hi",
+        "bk19", "bk19_lo", "bk19_hi"]
     assert table.index.names == ["front", "dilation_km"]
     assert table.loc[("cold", 111.0), "bk19"] == 0.40
     assert table.loc[("cold", 111.0), "D6C-f0_kriged-airs"] == 0.50
     assert np.isnan(table.loc[("dryline", 111.0), "bk19"])   # missing leg row
 
     saved = pd.read_csv(tmp_path / "comparison.csv")
-    assert set(saved.columns) == {"front", "dilation_km",
-                                  "D6C-f0_kriged-airs", "bk19"}
+    assert {"front", "dilation_km", "D6C-f0_kriged-airs", "bk19",
+            "bk19_lo", "bk19_hi"} <= set(saved.columns)
     # rerunning must not pick up comparison.csv itself as a leg
     table2 = evaluate_test.compare(out_dir=tmp_path)
-    assert list(table2.columns) == ["D6C-f0_kriged-airs", "bk19"]
+    assert list(table2.columns) == list(table.columns)
 
 
 def test_compare_empty_dir_raises(tmp_path):

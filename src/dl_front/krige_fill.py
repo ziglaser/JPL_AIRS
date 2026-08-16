@@ -266,12 +266,15 @@ def _build_degraded_day(args) -> tuple[str, list, list]:
     crop & ~observed, and every channel (kriged AND clean) is NaN
     out-of-crop.
     """
-    date_iso, hours, allow_small_bank = args
+    date_iso, hours, allow_small_bank, year = args
     date = pd.Timestamp(date_iso)
     crop = _crop()
     steps, notes = [], []
     for hour in hours:
         when = _step_timestamp(date, hour)
+        if year is not None and when.year != year:
+            # boundary spillover; the caller's year cut discards it anyway
+            continue
         rea = _reanalysis_step(when)
         if rea is None:
             notes.append(f"{hour:02d}Z: no sfc_daily reanalysis step")
@@ -307,21 +310,37 @@ def _build_degraded_day(args) -> tuple[str, list, list]:
 
 def _build_airs_day(args) -> tuple[str, list, list]:
     """One overpass day -> real AIRS-FCST steps (same return as degraded)."""
-    date_iso, hours, _allow_small_bank = args
+    date_iso, hours, _allow_small_bank, year = args
     date = pd.Timestamp(date_iso)
     crop = _crop()
     fullgrid = airs_fcst.find_fullgrid(date)
     if fullgrid is None:
         return date_iso, [], ["no fullgrid file"]
+    # load once, share across the day's hours (build_swath_bank's ds= pattern)
+    try:
+        ds = airs_fcst.load_fullgrid(fullgrid)
+    except _FULLGRID_ERRORS as err:
+        return date_iso, [], [f"unreadable fullgrid {Path(fullgrid).name} "
+                              f"({err}), day skipped"]
     steps, notes = [], []
     for hour in hours:
         try:
-            period = airs_fcst.period_fields(fullgrid, hour)
+            period = airs_fcst.period_fields(fullgrid, hour, ds=ds)
         except _FULLGRID_ERRORS as err:
-            notes.append(f"{hour:02d}Z: unreadable fullgrid "
-                         f"{Path(fullgrid).name} ({err}), skipped")
+            # covers unreadable files AND a missing forecast slot at this
+            # hour (airs_fcst._select_slot ValueError)
+            notes.append(f"{hour:02d}Z: skipped ({err})")
             continue
         when = pd.Timestamp(period["time"].values)
+        if year is not None and when.year != year:
+            # Boundary spillover: the caller's ts.year == year cut discards
+            # such steps anyway, but building them would demand sfc_daily
+            # OUTSIDE the build span -- the last year's Dec 31 hour-0 step
+            # lands on next Jan 1, a file no acquisition path produces, and
+            # the FileNotFoundError below would kill the whole build.
+            notes.append(f"{hour:02d}Z: step {when:%Y-%m-%d %HZ} outside "
+                         f"build year, skipped")
+            continue
         valid_frac = period["valid_frac"].values.astype(np.float32)
         # EVERY kriged channel needs >= 1 observed pixel INSIDE the crop
         # (schema v3, user decision 2026-08-13): krige_fill returns an
@@ -375,9 +394,10 @@ def _year_dates(year: int, hours) -> pd.DatetimeIndex:
 
 
 def _run_days(worker, dates, hours, workers: int,
-              allow_small_bank: bool = False) -> list:
+              allow_small_bank: bool = False, year: int | None = None) -> list:
     """Map a per-day builder over dates, log one line per day, collect steps."""
-    args = [(d.isoformat(), tuple(hours), allow_small_bank) for d in dates]
+    args = [(d.isoformat(), tuple(hours), allow_small_bank, year)
+            for d in dates]
     if workers > 1:
         pool = Pool(workers)
         results = pool.imap(worker, args)
@@ -441,7 +461,12 @@ def _write_year_cache(steps: list, source: str, year: int, path: Path,
                     swath_bank=bank_used)
     path.parent.mkdir(parents=True, exist_ok=True)
     enc = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
-    ds.to_netcdf(path, encoding=enc)
+    # write-then-rename: the year file doubles as the done-marker (both for
+    # the builder's own resume and the chain's skip_krige), so a walltime
+    # kill mid-write must not leave a truncated file behind
+    tmp = path.with_name(path.name + ".tmp")
+    ds.to_netcdf(tmp, encoding=enc)
+    tmp.replace(path)
     tag = "" if n else "  (WARNING: empty year)"
     print(f"{year}: wrote {n} steps -> {path}{tag}", flush=True)
     return path
@@ -493,7 +518,8 @@ def _build(worker, source: str, years, hours, workers: int, out_dir,
             written.append(path)
             continue
         dates = _year_dates(year, hours)[:max_days]
-        steps = _run_days(worker, dates, hours, workers, allow_small_bank)
+        steps = _run_days(worker, dates, hours, workers, allow_small_bank,
+                          year=year)
         steps = [s for s in steps if s[0].year == year]
         written.append(_write_year_cache(steps, source, year, path,
                                          bank_used))

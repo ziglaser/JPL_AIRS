@@ -18,6 +18,10 @@ source "${CONDA_PREFIX_ROOT:-$HOME/miniconda3}/etc/profile.d/conda.sh"
 conda activate fronts-tf
 cd "${JPL_AIRS_REPO:?set JPL_AIRS_REPO to the repo checkout}"
 export PYTHONPATH=src
+# one BLAS thread per Pool worker: the 8 forked --workers each spawn
+# node-core-count OpenBLAS threads by default, oversubscribing the 8-CPU
+# cgroup and slowing the dense OrdinaryKriging solves several-fold
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 echo "JPL_AIRS_DATA=${JPL_AIRS_DATA:-<unset: repo-local data/>}" \
      "JPL_AIRS_FCST=${JPL_AIRS_FCST:-<unset: data/HYSPLIT_demo>}" \
      "JPL_AIRS_RESULTS=${JPL_AIRS_RESULTS:-<unset: repo-local results/>}"

@@ -141,24 +141,17 @@ def slot_timestamp(ds: xr.Dataset, slot: int) -> pd.Timestamp:
 def _select_slot(ds: xr.Dataset, path, hour: int) -> tuple[int, pd.Timestamp]:
     """Hour in config.AIRS_HOURS -> (time slot, period timestamp).
 
-    Hour 18 = the AIRS overpass itself: slot 0, timestamped at the filename
-    window midpoint rounded to the 3-hourly label grid.  Hours 21/0 = the
-    uniform forecast slot whose parceltime matches (0 means next-day 00 UTC).
+    FORECAST SLOTS ONLY (user decision 2026-08-15): the returned slot is
+    the uniform forecast slot whose parceltime matches ``hour`` (0 means
+    next-day 00 UTC).  Slot 0 -- the overpass itself -- is never selected:
+    its per-pixel obs times span ~2.6 h across the domain (Aqua 13:30 LT
+    ascending), so no single 3-hourly label hour is correct for it, and
+    the earlier conventions (always-18Z clamp, review 2026-08-13; then a
+    nearest-label 19:30 rule) both left either misregistration or a mixed
+    retrieval/forecast input distribution.  Forecast slots are per-pixel
+    time-uniform, so every step is exactly label-aligned.  ValueError when
+    the file has no forecast slot at ``hour`` (callers skip-with-note).
     """
-    if hour == 18:
-        mid = overpass_midpoint(path)
-        when = mid.round("3h")
-        # A late overpass window (e.g. 1830-2230, midpoint 20:30) rounds to
-        # 21:00 -- the same timestamp as the hour-21 forecast slot.  Two
-        # steps at one time would break the exact-timestamp label join
-        # (duplicate time index) and zero the 21Z projection lead, so the
-        # overpass keeps its 18Z label convention: clamp to 18:00 of the
-        # filename date whenever rounding leaves the 18Z slot (the label
-        # grid is 3-hourly and the overpass IS the 18Z period by
-        # definition; review 2026-08-13).
-        if when.hour != 18:
-            when = mid.normalize() + pd.Timedelta(hours=18)
-        return 0, when
     for slot in range(1, ds.sizes["time"]):
         t = slot_timestamp(ds, slot)
         if t.hour == hour:

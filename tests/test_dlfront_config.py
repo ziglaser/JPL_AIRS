@@ -37,13 +37,13 @@ def test_dryline_splits_are_the_2026_08_12_decision():
 def test_airs_and_kriging_tunables():
     """The frozen AIRS/kriging knobs (interface spec 2026-08-12)."""
     vals = config.load_tunables()
-    assert vals["AIRS_HOURS"] == (18, 21, 0)
+    assert vals["AIRS_HOURS"] == (21, 0)
     # 985 = the deepest REAL fullgrid bin (30-hPa centers 115..1075): an
     # off-bin target such as 1000 hPa averages the observed indicator with
     # the always-empty 1015 bin and caps valid_frac at exactly the 0.5
     # threshold (bugfix 2026-08-12)
     assert vals["AIRS_SURFACE_LEVEL_HPA"] == 985
-    assert vals["KRIGED_CHANNELS"] == ("T2M", "QV2M")
+    assert vals["KRIGED_CHANNELS"] == ("T2M", "QV2M", "U10M", "V10M")
     assert vals["KRIGE_VARIOGRAM"] == "linear"
     assert vals["KRIGE_MAX_OBS"] == 1500
     assert vals["KRIGE_SEED"] == 20260812
@@ -55,7 +55,7 @@ def test_module_constants_come_from_yaml():
         value = getattr(config, const)
         assert not isinstance(value, list), f"{const} should be a tuple"
         assert isinstance(value, (numbers.Number, tuple, str)), const
-    assert config.MAX_EPOCHS == 1200          # spot-check a train.py consumer
+    assert config.MAX_EPOCHS == 600           # spot-check a train.py consumer
     assert config.LABEL_WIDTH == 3            # ...and a dataset.py consumer
 
 

@@ -395,20 +395,48 @@ def filter_hours(x: np.ndarray, y: np.ndarray, times: pd.DatetimeIndex,
     return x[keep], y[keep], times[keep]
 
 
-def fold_split(n: int, fold: int, n_folds: int = config.N_FOLDS,
-               seed: int = config.FOLD_SEED):
-    """Paper section 4.1: each fold trains on a random 2/3 of the samples.
+def fold_split(times, fold: int, n_folds: int = config.N_FOLDS,
+               seed: int = config.FOLD_SEED, years=None):
+    """Day-keyed CV split: a seeded permutation of CALENDAR DAYS.
 
-    A seeded permutation is cut into ``n_folds`` contiguous validation
-    chunks; fold k validates on chunk k and trains on the rest.
+    The paper (section 4.1) permuted individual time steps; this splits
+    whole days instead, for two reasons (audit + user decision 2026-08-15):
+
+    1. The old positional permutation was keyed to the SAMPLE COUNT, and
+       every curriculum stage has a different one (reanalysis carries ~8
+       label steps/day, the kriged caches 3, the AIRS archive has missing
+       days) -- so "fold k" named different timestamps at each stage and
+       ~2/3 of a fine-tune stage's validation steps had been in the
+       previous stage's training set.  Keying folds to the calendar day
+       makes membership identical across stages regardless of a source's
+       hours or coverage.
+    2. Same-day 18/21/00Z steps are strongly autocorrelated; keeping a
+       day's steps on one side of the split stops the val_loss driving
+       early stopping from being scored on near-duplicates of training
+       samples.
+
+    ``times``: per-sample timestamps.  ``years``: the day universe to
+    permute (default: the years present in ``times``); pass the
+    stage-independent training years so sparse sources still agree with
+    the full calendar.  Returns (train_idx, val_idx) into the sample axis.
     """
     if not 0 <= fold < n_folds:
         raise ValueError(f"fold must be in [0, {n_folds}), got {fold}")
-    perm = np.random.default_rng(seed).permutation(n)
+    times = pd.DatetimeIndex(times)
+    if years is None:
+        years = sorted(set(times.year))
+    universe = pd.DatetimeIndex(np.concatenate(
+        [pd.date_range(f"{y}-01-01", f"{y}-12-31").values for y in years]))
+    days = times.normalize()
+    unknown = ~days.isin(universe)
+    if unknown.any():
+        raise ValueError(
+            f"{int(unknown.sum())} samples fall outside the fold universe "
+            f"years {list(years)} (first: {times[unknown][0]})")
+    perm = np.random.default_rng(seed).permutation(len(universe))
     chunks = np.array_split(perm, n_folds)
-    val = chunks[fold]
-    train = np.concatenate([c for i, c in enumerate(chunks) if i != fold])
-    return train, val
+    is_val = days.isin(universe[chunks[fold]])
+    return np.flatnonzero(~is_val), np.flatnonzero(is_val)
 
 
 def make_tf_dataset(x: np.ndarray, y: np.ndarray, n_classes: int,

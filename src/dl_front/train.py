@@ -159,8 +159,9 @@ def run(name: str, n_classes: int, fold: int = 0,
         x, y, times = dataset.stack_years(years, n_classes, stats)
     elif source in config.KRIGED_SOURCE_DIRS:
         # Kriged caches (stage B' degraded / stage C real AIRS) share the
-        # reanalysis training years and the SAME fold permutation, so a
-        # curriculum's stages train and validate on comparable splits.
+        # reanalysis training years; fold membership is day-keyed below,
+        # so a calendar day sits in the same fold at every stage no matter
+        # how many steps each source carries for it.
         x, y, times = dataset.stack_kriged_years(years, n_classes, stats,
                                                  source)
     else:
@@ -168,7 +169,7 @@ def run(name: str, n_classes: int, fold: int = 0,
                          f"one of {sorted(config.KRIGED_SOURCE_DIRS)}")
     if hours is not None:
         x, y, times = dataset.filter_hours(x, y, times, hours)
-    tr, va = dataset.fold_split(len(x), fold)
+    tr, va = dataset.fold_split(times, fold, years=years)
     if smoke:
         tr, va = tr[:64], va[:32]
 

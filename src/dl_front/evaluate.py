@@ -160,3 +160,8 @@ def csi_counts(pred_cls: np.ndarray, y_cls: np.ndarray, times,
 
 def csi_scores(counts: pd.DataFrame) -> pd.DataFrame:
     return fd_evaluate.scores_from_counts(counts)
+
+
+#: Day-block circular bootstrap over the per-day counts (front_finder's
+#: implementation; iid resampling understates CIs 2-3x on synoptic data).
+block_bootstrap = fd_evaluate.block_bootstrap

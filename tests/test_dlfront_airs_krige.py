@@ -95,8 +95,7 @@ def test_find_fullgrid():
 
 @needs_demo
 @pytest.mark.parametrize("hour,expect_time", [
-    (18, "2019-06-05 18:00"),               # overpass midpoint rounded to 3 h
-    (21, "2019-06-05 21:00"),               # uniform forecast slots
+    (21, "2019-06-05 21:00"),               # uniform forecast slots only
     (0, "2019-06-06 00:00"),                # hour 0 = next-day 00 UTC
 ])
 def test_period_fields(hour, expect_time):
@@ -141,8 +140,8 @@ def test_build_airs_demo_day(tmp_path, monkeypatch):
         slp = xr.Dataset(
             {"SLP": (("time", "lat", "lon"),
                      np.full((2, *config.GRID_SHAPE), 101325.0, np.float32))},
-            coords={"time": [DEMO_DAY + pd.Timedelta(hours=18),
-                             DEMO_DAY + pd.Timedelta(hours=21)],
+            coords={"time": [DEMO_DAY + pd.Timedelta(hours=21),
+                             DEMO_DAY + pd.Timedelta(hours=23)],
                     "lat": np.asarray(config.LABEL_LATS),
                     "lon": np.asarray(config.LABEL_LONS)})
         monkeypatch.setattr(
@@ -168,9 +167,8 @@ def test_build_airs_demo_day(tmp_path, monkeypatch):
     assert ds.attrs["swath_bank"] in (str(config.SWATH_BANK_PATH),
                                       "per-day-envelope")
     assert list(ds["time"].values) == list(
-        pd.to_datetime(["2019-06-05 18:00", "2019-06-05 21:00",
-                        "2019-06-06 00:00"]))
-    assert tuple(ds.sizes[d] for d in ("time", "lat", "lon")) == (3,) + config.GRID_SHAPE
+        pd.to_datetime(["2019-06-05 21:00", "2019-06-06 00:00"]))
+    assert tuple(ds.sizes[d] for d in ("time", "lat", "lon")) == (2,) + config.GRID_SHAPE
     # schema v3: SFC_VARS gap-free INSIDE the crop (box + halo), NaN outside
     crop = dataset.crop_domain()
     for var in config.SFC_VARS:
@@ -204,25 +202,28 @@ def test_valid_frac_not_capped_at_threshold():
     valid_frac at exactly OBSERVED_MIN_FRACTION -- retention survived only by
     float-equality luck.  At the real 985-hPa bin the interp is exact."""
     path = airs_fcst.find_fullgrid(DEMO_DAY, root=DEMO_ROOT)
-    vf = airs_fcst.period_fields(path, 18)["valid_frac"].values
+    vf = airs_fcst.period_fields(path, 21)["valid_frac"].values
     assert vf.max() == 1.0                     # fully-surrounded pixels exist
     assert (vf > airs_fcst.OBSERVED_MIN_FRACTION).any()
 
 
-def test_select_slot_hour18_never_collides_with_21z():
-    """Regression (review 2026-08-13): a late overpass window rounded past
-    the 19:30 boundary (e.g. 1830-2230, midpoint 20:30 -> round('3h') =
-    21:00) and collided with the hour-21 forecast slot -- a duplicate time
-    index downstream and a zero 21Z projection lead.  The overpass keeps
-    its 18Z label convention regardless of the window."""
-    late = "fullgrid_wrf27km_GOOD_1p00deg_20190605_1830-2230.nc"
-    slot, when = airs_fcst._select_slot(None, late, 18)   # ds unused at 18Z
-    assert slot == 0
-    assert when == pd.Timestamp("2019-06-05 18:00")
-    # an early window (demo-like, midpoint ~18:59) still rounds to 18:00
-    early = "fullgrid_wrf27km_GOOD_1p00deg_20190605_1826-2033.nc"
-    assert airs_fcst._select_slot(None, early, 18)[1] == \
-        pd.Timestamp("2019-06-05 18:00")
+@needs_demo
+def test_select_slot_forecast_slots_only():
+    """User decision 2026-08-15 (forecast window only): slot 0 -- the
+    overpass, whose per-pixel obs times span ~2.6 h -- is never selected;
+    hours resolve to the uniform forecast slots, and an hour with no
+    forecast slot (18Z, the old overpass label hour) raises (callers
+    skip-with-note)."""
+    path = airs_fcst.find_fullgrid(DEMO_DAY, root=DEMO_ROOT)
+    ds = airs_fcst.load_fullgrid(path)
+    slot, when = airs_fcst._select_slot(ds, path, 21)
+    assert slot >= 1                          # never the overpass slot
+    assert when == pd.Timestamp("2019-06-05 21:00")
+    slot0, when0 = airs_fcst._select_slot(ds, path, 0)
+    assert slot0 >= 1
+    assert when0 == pd.Timestamp("2019-06-06 00:00")
+    with pytest.raises(ValueError, match="no forecast slot"):
+        airs_fcst._select_slot(ds, path, 18)
 
 
 def test_classify_step_gaps_bank_draw_uses_own_envelope(tmp_path,

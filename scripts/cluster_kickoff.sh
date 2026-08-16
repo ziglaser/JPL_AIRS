@@ -13,6 +13,11 @@ export SBATCH_GPU_PARTITION=${SBATCH_GPU_PARTITION:-gpu}
 export PYTHONPATH=src
 
 CONDA_ROOT=${CONDA_PREFIX_ROOT:-$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")}
+# sbatch jobs re-source conda from CONDA_PREFIX_ROOT (slurm/dlfront_*.sbatch)
+# and inherit it via --export=ALL -- must be exported or every job dies at
+# "conda.sh: No such file or directory" on clusters where conda isn't at
+# ~/miniconda3 (gattaca2 post-mortem 2026-08-15, job 572450).
+export CONDA_PREFIX_ROOT="$CONDA_ROOT"
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate fronts-tf
 
@@ -38,12 +43,34 @@ SZ=$(bank_size)
 [ "$SZ" -ge 30 ] || { log "FATAL: gap bank size $SZ < 30 after harvest"; exit 1; }
 log "gap bank OK: $SZ fields"
 
+# sfc_daily completeness, per year (a bare dir-existence test is repair-blind:
+# acquire creates the year dir before its first download succeeds).  build-airs
+# kriges 2007-2021 and hard-requires the clean-SLP reanalysis step for every
+# built day -- a hole doesn't just weaken eval legs, it kills phase 3a and
+# dependency-cancels D6C + ALL evals + compare.  365 approximates leap years.
+SFC="$JPL_AIRS_DATA/front_id/reanalysis/MERRA2/sfc_daily"
+PRE_MISSING=() ACQ_MISSING=()
+for y in $(seq 2007 2021); do
+    n=$(find "$SFC/$y" -name 'm2sfc_*' -type f 2>/dev/null | wc -l)
+    if [ "$n" -lt 365 ]; then
+        if [ "$y" -ge 2016 ]; then ACQ_MISSING+=("$y($n)")
+        else PRE_MISSING+=("$y($n)"); fi
+    fi
+done
+if [ ${#PRE_MISSING[@]} -gt 0 ]; then
+    log "FATAL: sfc_daily incomplete for pre-2016 years: ${PRE_MISSING[*]}."
+    log "Phase 0 only fetches 2016-2021; the archive itself needs fixing. Not submitting."
+    exit 1
+fi
 EXTRA=()
-if [ ! -d "$JPL_AIRS_DATA/front_id/reanalysis/MERRA2/sfc_daily/2016" ]; then
+if [ ${#ACQ_MISSING[@]} -gt 0 ]; then
     if [ -f "$HOME/.netrc" ]; then
-        EXTRA+=(--with-acquire); log "sfc_daily 2016 missing -> adding --with-acquire"
+        EXTRA+=(--with-acquire)
+        log "sfc_daily incomplete for ${ACQ_MISSING[*]} -> adding --with-acquire"
     else
-        log "WARNING: sfc_daily 2016-2018 missing and no ~/.netrc; reanalysis eval legs will fail (trainings unaffected; rerun chain after acquiring)"
+        log "FATAL: sfc_daily incomplete for ${ACQ_MISSING[*]} and no ~/.netrc."
+        log "build-airs 2007-2021 would crash mid-run and cancel D6C + all evals. Not submitting."
+        exit 1
     fi
 fi
 

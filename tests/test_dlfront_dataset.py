@@ -145,17 +145,34 @@ def test_valid_label_steps_6class_guards_full_crop_domain():
     np.testing.assert_array_equal(dataset.valid_label_steps(lab, 5), [True])
 
 
-def test_fold_split_paper_semantics():
-    """3 folds: each validates on a disjoint third, trains on the rest."""
+def test_fold_split_day_keyed_semantics():
+    """Day-keyed folds (audit 2026-08-15): disjoint val thirds covering all
+    samples, same-day steps never straddle train/val, and fold membership
+    agrees across sources with different steps-per-day (the curriculum
+    stages)."""
+    days = pd.date_range("2010-01-01", "2010-12-31")
+    t8 = pd.DatetimeIndex(np.repeat(days, 8)) + \
+        pd.TimedeltaIndex(np.tile(np.arange(8) * 3, len(days)), unit="h")
     all_val = []
     for fold in range(config.N_FOLDS):
-        tr, va = dataset.fold_split(300, fold)
-        assert len(tr) == 200 and len(va) == 100
+        tr, va = dataset.fold_split(t8, fold, years=[2010])
         assert not set(tr) & set(va)
+        # whole days on one side: no day appears in both partitions
+        assert not set(t8[tr].normalize()) & set(t8[va].normalize())
         all_val.append(set(va))
-    assert set().union(*all_val) == set(range(300))
+    assert set().union(*all_val) == set(range(len(t8)))
+    # a 3-steps/day source (stage B/C cache, some days missing) assigns
+    # each DAY to the same fold as the 8-steps/day source (stage A)
+    sparse_days = days[::2]                       # sparse AIRS-like coverage
+    t3 = pd.DatetimeIndex(np.repeat(sparse_days, 3)) + \
+        pd.TimedeltaIndex(np.tile([0, 18, 21], len(sparse_days)), unit="h")
+    _, va8 = dataset.fold_split(t8, 0, years=[2010])
+    _, va3 = dataset.fold_split(t3, 0, years=[2010])
+    assert set(t3[va3].normalize()) <= set(t8[va8].normalize())
     with pytest.raises(ValueError):
-        dataset.fold_split(300, 3)
+        dataset.fold_split(t8, 3)
+    with pytest.raises(ValueError):   # samples outside the universe
+        dataset.fold_split(t8, 0, years=[2011])
 
 
 def test_sfc_x_standardizes():
@@ -286,9 +303,9 @@ def test_filter_hours():
     x = np.arange(4, dtype=np.float16)[:, None, None, None]
     y = np.arange(4, dtype=np.uint8)[:, None, None]
     fx, fy, ft = dataset.filter_hours(x, y, times, config.AIRS_HOURS)
-    np.testing.assert_array_equal(fx.ravel(), [0, 1, 2])
-    np.testing.assert_array_equal(fy.ravel(), [0, 1, 2])
-    assert list(ft) == list(times[:3])
+    np.testing.assert_array_equal(fx.ravel(), [1, 2])   # AIRS_HOURS = (21, 0)
+    np.testing.assert_array_equal(fy.ravel(), [1, 2])
+    assert list(ft) == list(times[1:3])
     assert fx.dtype == np.float16 and fy.dtype == np.uint8
 
 

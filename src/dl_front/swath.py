@@ -169,10 +169,17 @@ def build_swath_bank(years, hours=None, root=None,
 
     freq = counts / np.maximum(n_days[..., None, None], 1)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path, freq=freq.astype(np.float32), n_days=n_days,
-        hours=np.asarray(hours),
-        years=np.asarray(sorted(set(int(y) for y in years))))
+    # write-then-rename via a file handle (savez_compressed would append
+    # .npz to a bare tmp NAME): the npz doubles as the chain's done-marker
+    # (skip_bank), so a kill mid-write must not leave a truncated bank that
+    # gets skipped forever while crashing every 2a/3a load
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        np.savez_compressed(
+            fh, freq=freq.astype(np.float32), n_days=n_days,
+            hours=np.asarray(hours),
+            years=np.asarray(sorted(set(int(y) for y in years))))
+    tmp.replace(path)
     print(f"wrote {path}: {int(n_days.sum())} (day, hour) composites, "
           f"cycle-day day counts {n_days.min(1).tolist()}", flush=True)
     return path

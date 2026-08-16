@@ -36,9 +36,11 @@ training:
                         # cluster GPUs (decision 2026-08-14; was 32 for the
                         # GTX 1070). lr kept at the paper's 1e-4 — inside its
                         # reported 5e-5..5e-4 insensitive range at this batch
-  max_epochs: 1200      # paper trained "for 1200 epochs" (folds stopped at
-                        # 1136-1142 under the patience rule below); restored
-                        # from the 600 GTX-1070 wall-clock cap (2026-08-14)
+  max_epochs: 600       # paper trained "for 1200 epochs" (folds stopped at
+                        # 1136-1142 under the patience rule below); capped at
+                        # 600 for wall-clock (user decision 2026-08-15 --
+                        # briefly 1200 on 2026-08-14; NOTE this stops short
+                        # of where the paper's folds converged)
   patience: 100         # "Training stopped when the loss did not improve for
                         # 100 epochs" (early stopping on val_loss)
   n_folds: 3            # section 4.1: 3-fold cross-validation, each fold
@@ -71,8 +73,12 @@ splits:
   # identical years for consistency.
   eval_years_6class: [2016, 2017, 2018]
 
-# Stage-B "AIRS simulator" degradation of the T2M/QV2M channels only
-# (winds/SLP come from forecast fields on the JPL laptop, so they stay clean).
+# LEGACY on-the-fly degradation (train.py --degraded ONLY -- the deployed
+# chain trains stage B on the precomputed kriged-degraded cache, which
+# punches real AIRS gap masks into clean reanalysis and kriges them back
+# WITHOUT retrieval noise; user decision 2026-08-15: keep it noise-free,
+# since realistic scene-correlated retrieval error is not well modeled by
+# these white/lognormal sigmas anyway).
 degradation:
   t2m_noise_sigma_k: 1.7       # near-surface AIRS T error (Divakarla et al.
                                # 2006: RMS 1.5-2 K in the lowest 2 km)
@@ -92,7 +98,17 @@ airs:
   # maps to the 18Z bulletin, the uniform forecast slots to 21Z and next-day
   # 00Z (parceltime audit 2026-08-12).  Also the default evaluate_test hours
   # filter, so reanalysis and kriged-AIRS scores use identical time steps.
-  hours: [18, 21, 0]
+  # FORECAST-WINDOW ONLY (user decision 2026-08-15): the two uniform
+  # forecast slots that coincide with 3-hourly analyst labels -- 21Z
+  # (~1-2.5 h lead) and next-day 00Z (~4-5.5 h lead).  The overpass slot
+  # itself is no longer used: its per-pixel obs times span ~2.6 h across
+  # the domain (west observed up to ~2.6 h after east), so no single label
+  # hour is correct for it -- W-domain fronts sat 50-130 km east of their
+  # nominal-18Z labels.  Forecast slots are per-pixel time-uniform, making
+  # every step exactly label-aligned; 23Z/01Z were considered and rejected
+  # (no analyst labels off the 3-hourly grid; interpolating thin-line
+  # front positions would reinject label error).
+  hours: [21, 0]
   # Pressure level standing in for the 2-m/10-m surface fields.  The fullgrid
   # level axis holds 30-hPa BIN CENTERS 115..1075 hPa; the bottom three bins
   # (1015/1045/1075) are always empty and 985 hPa (~10% coverage over the
@@ -102,11 +118,14 @@ airs:
   # 1015-hPa bin and caps valid_frac at 0.5 -- exactly the observed_min_
   # fraction threshold -- collapsing coverage to ~0.9% of the grid.
   surface_level_hpa: 985
-  # Channels gap-filled by kriging in the DEGRADED-reanalysis stage: the two
-  # AIRS-retrieved thermodynamic fields.  Winds/SLP stay clean reanalysis
-  # there (same rationale as the degradation section); build_airs kriges all
-  # four AIRS-derived channels regardless.
-  kriged_channels: [T2M, QV2M]
+  # Channels gap-filled by kriging in the DEGRADED-reanalysis stage.  User
+  # decision 2026-08-15 (science audit): winds are masked+kriged too --
+  # stage C's builder kriges all four AIRS-derived channels, and leaving
+  # winds clean in stage B taught the network to lean on the one channel
+  # family stage C then corrupts hardest (kriged 985-hPa winds arrive with
+  # ~+1.4/+2.1 m/s mean shifts and roughly halved variance vs the frozen
+  # 10-m stats).  Only SLP stays clean reanalysis in both stages.
+  kriged_channels: [T2M, QV2M, U10M, V10M]
   # Cells covered in at least this fraction of a cycle-day's composited
   # overpasses count as inside the expected 16-day-repeat swath (Zach asked
   # for the 5-10% band, 2026-08-13); below it a cell is out-of-swath and a

@@ -186,8 +186,9 @@ skip_krige() {  # skip_krige <cache-dir> <first-year> <last-year>
             # resubmitting without FORCE cannot fix this: the builder
             # skips existing year files, so the stale cache would survive
             note "ERROR: $f is not a schema-v3 cache (pre-domain v1/v2 or" \
-                 "unreadable).  Rerun with FORCE=1 (passes --force to the" \
-                 "krige builders) or delete $1 first."
+                 "unreadable).  Delete THAT FILE and rerun (rebuilds just" \
+                 "that year).  FORCE=1 also works but is GLOBAL: it re-runs" \
+                 "every completed training and rebuilds every year cache."
             exit 3
         fi
     done

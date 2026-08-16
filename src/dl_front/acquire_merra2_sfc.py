@@ -127,7 +127,7 @@ def download_day(date: pd.Timestamp, retries: int = 2) -> bool:
         _jars.put(jar)
 
 
-def download_year(year: int) -> None:
+def download_year(year: int) -> bool:
     dates = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
     missing = [d for d in dates if not day_path(d).exists()]
     print(f"{year}: {len(dates) - len(missing)} present, {len(missing)} to fetch",
@@ -146,16 +146,21 @@ def download_year(year: int) -> None:
                         f.cancel()
                     print(f"{year}: aborting after {streak} consecutive "
                           f"failures; {len(failed)} failed so far", flush=True)
-                    return
+                    return False
             if (i + 1) % 50 == 0:
                 print(f"  {year}: {i + 1}/{len(missing)} "
                       f"({len(failed)} failed)", flush=True)
     if failed:
         print(f"{year}: FAILED days: {[f'{d:%m-%d}' for d in failed]}", flush=True)
-    else:
-        print(f"{year}: complete", flush=True)
+        return False
+    print(f"{year}: complete", flush=True)
+    return True
 
 
 if __name__ == "__main__":
-    for y in sys.argv[1:]:
-        download_year(int(y))
+    # exit nonzero on ANY incomplete year so callers under `set -e` (the
+    # chain's phase 0) refuse to submit against a partial corpus -- an
+    # aborted acquire previously exited 0 and the missing days surfaced
+    # only days later inside build-airs / the eval legs
+    ok = [download_year(int(y)) for y in sys.argv[1:]]
+    sys.exit(0 if all(ok) else 1)

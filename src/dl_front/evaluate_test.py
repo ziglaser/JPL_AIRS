@@ -72,7 +72,8 @@ import pandas as pd
 from . import config, dataset, evaluate, predict
 
 #: Column order of the tidy CSI CSV (frozen interface, 2026-08-12).
-CSI_CSV_COLUMNS = ["front", "dilation", "km", "csi", "pod", "far", "fb"]
+CSI_CSV_COLUMNS = ["front", "dilation", "km", "csi", "csi_lo", "csi_hi",
+                   "pod", "far", "fb"]
 
 
 # --------------------------------------------------------------------------- #
@@ -293,7 +294,15 @@ def evaluate_ckpt(model, years, n_classes: int, source: str,
         info.update(n_steps_per_year={int(y): int(n)
                                       for y, n in n_steps.items()},
                     times_sha1=digest, match_source=match_source)
-    scores = evaluate.csi_scores(pd.concat(counts, ignore_index=True))
+    all_counts = pd.concat(counts, ignore_index=True)
+    scores = evaluate.csi_scores(all_counts)
+    # Day-block bootstrap CIs (audit + user decision 2026-08-15): cross-leg
+    # CSI deltas -- dryline especially, ~150-190 event-bearing steps/year
+    # and strongly autocorrelated -- are not interpretable without
+    # uncertainty; deltas inside overlapping CIs are sampling noise.
+    boot = evaluate.block_bootstrap(all_counts)
+    scores["csi_lo"] = boot.lo["csi"]
+    scores["csi_hi"] = boot.hi["csi"]
     return pm, scores
 
 
@@ -407,8 +416,9 @@ def compare(out_dir: Path | None = None) -> pd.DataFrame:
     than the others (missing sfc_daily day files, a stale ``--no-match`` or
     partial ``--years`` run); each leg's ``_run.json`` records a SHA-1 of
     its scored timestamps, and any disagreement across legs is reported
-    loudly here (the table is still written -- the warning tells you which
-    leg to rerun).
+    loudly here AND encoded in the output name (the table is written as
+    ``comparison_MISMATCHED_SAMPLE.csv``; the warning tells you which leg
+    to rerun).
     """
     out_dir = Path(out_dir) if out_dir is not None \
         else config.RESULTS_DIR / "test_eval"
@@ -420,7 +430,10 @@ def compare(out_dir: Path | None = None) -> pd.DataFrame:
         if not set(CSI_CSV_COLUMNS) <= set(df.columns):
             print(f"skipping {path.name}: not a CSI leg CSV", flush=True)
             continue
-        legs[path.stem] = df.set_index(["front", "km"])["csi"]
+        idx = df.set_index(["front", "km"])
+        legs[path.stem] = idx["csi"]
+        legs[f"{path.stem}_lo"] = idx["csi_lo"]
+        legs[f"{path.stem}_hi"] = idx["csi_hi"]
         run_path = path.with_name(f"{path.stem}_run.json")
         try:
             provenance[path.stem] = json.loads(run_path.read_text())
@@ -429,10 +442,14 @@ def compare(out_dir: Path | None = None) -> pd.DataFrame:
     if not legs:
         raise FileNotFoundError(f"no leg CSVs found in {out_dir}; run some "
                                 f"evaluations first")
-    _check_same_sample(provenance)
+    same_sample = _check_same_sample(provenance)
     table = pd.DataFrame(legs)                # aligns on the index union
     table.index.names = ["front", "dilation_km"]
-    out_path = out_dir / "comparison.csv"
+    # a non-like-for-like table must not masquerade as the headline result:
+    # the stdout warning never reaches CSV consumers, so the mismatch is
+    # encoded in the artifact's NAME (audit 2026-08-15)
+    out_path = out_dir / ("comparison.csv" if same_sample
+                          else "comparison_MISMATCHED_SAMPLE.csv")
     table.to_csv(out_path)
     print(table.to_string(float_format=lambda v: f"{v:.3f}"))
     print(f"\nwrote {out_path}")
