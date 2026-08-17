@@ -21,4 +21,5 @@ dependencies:
       - PyYAML==6.0.3
       - pykrige==1.7.3
       - shapely==2.0.6  # fronts/ submodule (upstream master utils/data_utils.py)
+      - tqdm==4.66.5
       - pytest

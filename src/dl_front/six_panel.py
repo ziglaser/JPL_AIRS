@@ -33,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from . import config, dataset, evaluate_test, predict
 from .quicklook import INK, OUT_OF_DOMAIN_GRAY, _style_axis, _window
@@ -89,7 +90,7 @@ def sample_pool(n_classes: int, stats: dict) -> tuple[pd.DataFrame, dict]:
     """Candidate (year, time) rows common to all three sources, Mar-Nov
     only, plus the loaded per-year source dict (reused for every draw)."""
     rows, year_sources = [], {}
-    for year in YEARS:
+    for year in tqdm(YEARS, desc="loading years", unit="yr"):
         src = _load_sources(year, n_classes, stats)
         year_sources[year] = src
         common = src["reanalysis"][2]
@@ -186,7 +187,10 @@ def main(argv=None):
                 .sort_values(["year", "time"])
 
     written = []
-    for year, when in zip(chosen["year"], chosen["time"]):
+    steps = tqdm(list(zip(chosen["year"], chosen["time"])),
+                desc="rendering", unit="fig")
+    for year, when in steps:
+        steps.set_postfix_str(f"{when:%Y-%m-%d %H:%MZ}")
         src = year_sources[year]
         xr_, yr_, tr_ = src["reanalysis"]
         xa_, ya_, ta_ = src["kriged-airs"]
@@ -207,7 +211,7 @@ def main(argv=None):
         path = render(when, truth, bk19_pred, a_air, a_rea, c_air, c_rea,
                      a.classes, a.fold, out_dir)
         written.append(path)
-        print(f"{when:%Y-%m-%d %H:%MZ}: wrote {path}", flush=True)
+        steps.write(f"{when:%Y-%m-%d %H:%MZ}: wrote {path}")
 
     print(f"wrote {len(written)} six-panel figures to {out_dir}", flush=True)
     return written
