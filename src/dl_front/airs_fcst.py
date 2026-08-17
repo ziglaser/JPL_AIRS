@@ -14,23 +14,22 @@ surface-pressure/SLP variable.
 The conversion pipeline mirrors the proven ``front_finder.ingest_hysplit``
 (fill -> NaN, unit fixes, observed indicator BEFORE any interpolation,
 vertical then bilinear horizontal interpolation, embed into the 68 x 141
-label grid) but targets the SINGLE near-surface level
-``config.AIRS_SURFACE_LEVEL_HPA`` and emits the DL-FRONT channel names
-T2M/QV2M/U10M/V10M.
+label grid) but reduces each column to a SINGLE terrain-following surface
+value and emits the DL-FRONT channel names T2M/QV2M/U10M/V10M.
 
-Vertical subtlety: the level axis holds the 30-hPa BIN CENTERS 115..1075
-hPa, the bottom three bins (1015/1045/1075 hPa) are always empty and
-985 hPa (~10 % observed over the swath) is the deepest real retrieval, so
-``config.AIRS_SURFACE_LEVEL_HPA`` defaults to 985 -- an actual bin, where
-the linear interp of both fields and indicator is exact.  (A between-bin
-target such as 1000 hPa would average the indicator with the always-zero
-1015-hPa bin and mathematically cap ``valid_frac`` at 0.5, i.e. at the
-``>= OBSERVED_MIN_FRACTION`` threshold itself; audit 2026-08-12.)  Fields
-are additionally filled DOWNWARD (each column's deepest finite bin extends
-to the bins below) before the linear interp so an off-bin target still
-yields the deepest real retrieval instead of NaN; the observed indicator
-keeps the pure linear interp, so the ``valid_frac >= OBSERVED_MIN_FRACTION``
-cut still requires the retrieval bin itself to be observed around the pixel.
+Vertical extraction is TERRAIN-FOLLOWING (user decision 2026-08-16): each
+column's surface value comes from its DEEPEST retrieval bin (level axis =
+30-hPa bin centers 115..1075 hPa) at or below config.AIRS_SURFACE_SCAN_
+FLOOR_HPA, accepted only when that bin sits within config.AIRS_SURFACE_
+MAX_AGL_M of the local ground (static hypsometric terrain map,
+scripts/build_surface_elevation.py); T is then extrapolated to the ground
+at config.AIRS_SURFACE_LAPSE_K_PER_KM, q held constant, u/v taken from the
+bin unchanged.  The previous fixed-985-hPa target had ZERO coverage over
+all elevated terrain -- the high plains (1-2 km ASL, surface pressure
+~800-850 hPa) never have 985-hPa air, so the entire dryline region looked
+permanently out-of-swath while per-level checks showed it observed BETTER
+than the east at 715-865 hPa (post-mortem 2026-08-16; cross-validated
+against the nogrid granule parcels and FCST_SMAP_MRMS coverage).
 """
 from __future__ import annotations
 
@@ -54,6 +53,88 @@ FILL = -9999.0
 OBSERVED_MIN_FRACTION = config.OBSERVED_MIN_FRACTION
 #: fullgrid variable -> DL-FRONT surface channel it stands in for.
 CHANNEL_MAP = {"t": "T2M", "q": "QV2M", "u": "U10M", "v": "V10M"}
+
+_ELEV_CACHE: dict = {}
+
+#: The fitted layer: all finite bins from the column's deepest retrieval up
+#: to LAPSE_MAX_DZ_M above it enter the least-squares fit, and the fit is
+#: trusted only when they span at least LAPSE_MIN_DZ_M of depth.  Within an
+#: afternoon boundary layer T is close to linear in z (a well-mixed
+#: convective layer is the MOST linear case, ~dry-adiabatic), so a fit over
+#: the lowest ~2 km is the stable estimator: k bins cut retrieval-noise
+#: variance ~1/k, where any 2-point difference over adjacent 30-hPa bins
+#: (~250-300 m) would carry ~7-10 K/km of noise from ~1.5-2 K T errors.
+LAPSE_MIN_DZ_M = 400.0
+LAPSE_MAX_DZ_M = 2000.0
+
+
+def _column_lapse(one: "xr.Dataset", sub: np.ndarray, idx: np.ndarray,
+                  at_deepest) -> np.ndarray:
+    """Per-column lapse rate (K/m, positive = cooling with height).
+
+    Least-squares slope of T against altitude over ALL finite bins within
+    LAPSE_MAX_DZ_M above the deepest bin (user decision 2026-08-16, refined
+    same day from a 2-point difference to the multi-bin fit for noise
+    stability), clipped to config.AIRS_SURFACE_LAPSE_CLIP_K_PER_KM.
+    Columns whose usable bins span < LAPSE_MIN_DZ_M (or < 2 bins) fall back
+    to config.AIRS_SURFACE_LAPSE_K_PER_KM.  Disable via
+    ``airs.surface_lapse_derived: false`` (fallback everywhere).
+    """
+    default = float(config.AIRS_SURFACE_LAPSE_K_PER_KM) / 1000.0
+    if not config.AIRS_SURFACE_LAPSE_DERIVED:
+        return np.full(idx.shape, default)
+
+    lev = one["level"].values
+    scan = lev >= float(config.AIRS_SURFACE_SCAN_FLOOR_HPA)
+    alt3 = one["alt"].values[scan]
+    t3 = one["t"].values[scan]
+    alt0 = at_deepest("alt")
+
+    li = np.arange(sub.shape[0])[:, None, None]
+    dz = alt3 - alt0[None]
+    w = sub & (li <= idx[None]) & (dz >= 0) & (dz <= LAPSE_MAX_DZ_M)
+
+    zf = np.where(w, alt3, 0.0)
+    tf_ = np.where(w, t3, 0.0)
+    n = w.sum(axis=0)
+    sz, st = zf.sum(axis=0), tf_.sum(axis=0)
+    szz = (zf * zf).sum(axis=0)
+    szt = (zf * tf_).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        slope = (n * szt - sz * st) / (n * szz - sz * sz)
+    depth = np.where(w, dz, 0.0).max(axis=0)
+    valid = (n >= 2) & (depth >= LAPSE_MIN_DZ_M) & np.isfinite(slope)
+    lapse = np.where(valid, -slope, default)     # positive = cooling with z
+    lo, hi = (float(v) / 1000.0
+              for v in config.AIRS_SURFACE_LAPSE_CLIP_K_PER_KM)
+    return np.clip(lapse, lo, hi)
+
+
+def _surface_elev_native(one: "xr.Dataset") -> np.ndarray:
+    """Ground elevation (m ASL) on ``one``'s native half-degree grid.
+
+    Bilinear from the static label-grid map (config.SURFACE_ELEV_PATH,
+    built by scripts/build_surface_elevation.py); cached per native grid.
+    """
+    key = (float(one["lat"][0]), float(one["lon"][0]),
+           one.sizes["lat"], one.sizes["lon"])
+    if key not in _ELEV_CACHE:
+        if not config.SURFACE_ELEV_PATH.exists():
+            # deliberately NOT FileNotFoundError: that is an OSError, which
+            # the per-step skip-with-note handlers (_FULLGRID_ERRORS, the
+            # swath sweep) would swallow -- a missing terrain map would then
+            # silently produce EMPTY banks/caches that act as done-markers
+            raise RuntimeError(
+                f"{config.SURFACE_ELEV_PATH} does not exist -- the "
+                f"terrain-following surface extraction needs it; build it "
+                f"once with 'PYTHONPATH=src python "
+                f"scripts/build_surface_elevation.py'")
+        with xr.open_dataset(config.SURFACE_ELEV_PATH) as elev_ds:
+            elev = elev_ds["elev_m"].load()
+        _ELEV_CACHE[key] = elev.interp(
+            lat=one["lat"].values, lon=one["lon"].values,
+            method="linear").values.astype(np.float64)
+    return _ELEV_CACHE[key]
 
 
 # --------------------------------------------------------------------------- #
@@ -157,28 +238,6 @@ def _select_slot(ds: xr.Dataset, path, hour: int) -> tuple[int, pd.Timestamp]:
         if t.hour == hour:
             return slot, t
     raise ValueError(f"{Path(path).name}: no forecast slot at hour {hour}")
-
-
-# --------------------------------------------------------------------------- #
-# Regridding to the label grid
-# --------------------------------------------------------------------------- #
-
-def _fill_down(da: xr.DataArray) -> xr.DataArray:
-    """Extend each column's deepest finite value downward along ``level``.
-
-    Level increases with pressure, so "down" (toward the surface) is the
-    increasing-index direction; columns with no finite value stay NaN.
-    Equivalent to a bottleneck-free ``ffill('level')``.
-    """
-    da = da.transpose("level", ...)
-    vals = da.values
-    finite = np.isfinite(vals)
-    idx = np.where(finite, np.arange(vals.shape[0]).reshape(
-        -1, *([1] * (vals.ndim - 1))), 0)
-    idx = np.maximum.accumulate(idx, axis=0)
-    return da.copy(data=np.take_along_axis(vals, idx, axis=0))
-
-
 def period_fields(path, hour: int, ds: xr.Dataset | None = None) -> xr.Dataset:
     """One AIRS period -> surface channels on the full 68 x 141 label grid.
 
@@ -197,30 +256,52 @@ def period_fields(path, hour: int, ds: xr.Dataset | None = None) -> xr.Dataset:
         ds = load_fullgrid(path)
     slot, when = _select_slot(ds, path, hour)
     one = ds.isel(time=slot)
-    # observed indicator BEFORE interpolation so swath geometry survives
-    obs = (one["N"].fillna(0) > 0).astype("float64")
-    fields = one[list(CHANNEL_MAP)]
 
-    # vertical: fields fill-down + linear, indicator pure linear (docstring
-    # at module top explains why they differ), both to the single target.
-    # A target ON a bin center is selected exactly: interp evaluates the
-    # LEFT interval even at a node, so a NaN in the bin above (e.g. 955 hPa
-    # unobserved over an observed 985) would poison the exact-bin value.
-    target = float(config.AIRS_SURFACE_LEVEL_HPA)
-    fields = fields.map(_fill_down)
-    if np.isin(target, fields["level"].values):
-        fields = fields.sel(level=target)
-        obs = obs.sel(level=target)
-    else:
-        fields = fields.interp(level=target, method="linear")
-        obs = obs.interp(level=target, method="linear")
-    # binarized native indicator: the retrieval bin itself must be observed
-    # AND carry every channel (a cell with parcels but a missing retrieval
-    # for any variable would otherwise enter the average as garbage)
-    ind = obs >= OBSERVED_MIN_FRACTION
-    for var in fields.data_vars:
-        ind = ind & np.isfinite(fields[var])
-    ind = ind.astype("float64")
+    # TERRAIN-FOLLOWING vertical extraction (user decision 2026-08-16;
+    # replaces the fixed 985-hPa target, which had zero coverage over all
+    # elevated terrain -- the high plains never have 985-hPa air, so the
+    # dryline region looked permanently out-of-swath).  Per column: take
+    # the DEEPEST retrieval bin that carries every channel + alt, require
+    # it to sit within AIRS_SURFACE_MAX_AGL_M of the local ground (rejects
+    # cloud-blocked columns whose lowest retrieval is mid-tropospheric),
+    # then extrapolate T down to the ground at the standard lapse rate,
+    # hold q constant, and take u/v from the bin unchanged (proper MOST
+    # needs surface fluxes/stability AIRS cannot provide).
+    lev = one["level"].values
+    scan = lev >= float(config.AIRS_SURFACE_SCAN_FLOOR_HPA)
+    need = list(CHANNEL_MAP) + ["alt"]
+    obs3d = (one["N"].fillna(0) > 0).values
+    for var in need:
+        obs3d = obs3d & np.isfinite(one[var].values)
+    sub = obs3d[scan]                       # (nlev, nlat, nlon), level asc.
+    rev = sub[::-1]                         # deepest (highest pressure) first
+    has = rev.any(axis=0)
+    idx = sub.shape[0] - 1 - rev.argmax(axis=0)
+
+    def _at_deepest(var: str) -> np.ndarray:
+        vals = one[var].values[scan]
+        return np.take_along_axis(vals, idx[None], 0)[0]
+
+    zs = _surface_elev_native(one)          # ground elevation, native grid
+    agl = _at_deepest("alt") - zs
+    ok = has & np.isfinite(zs) & (agl <= float(config.AIRS_SURFACE_MAX_AGL_M))
+    # negative AGL (retrieval "below" the climatological ground: hypsometric
+    # noise / sub-grid valleys) is fine as an observation; just never
+    # extrapolate upward
+    dz = np.clip(np.where(ok, agl, np.nan), 0.0, None)
+
+    lapse = _column_lapse(one, sub, idx, _at_deepest)
+    surf = {"t": _at_deepest("t") + lapse * dz,
+            "q": np.where(ok, _at_deepest("q"), np.nan),
+            "u": np.where(ok, _at_deepest("u"), np.nan),
+            "v": np.where(ok, _at_deepest("v"), np.nan)}
+    fields = xr.Dataset(
+        {k: (("lat", "lon"), v.astype(np.float64)) for k, v in surf.items()},
+        coords={"lat": one["lat"].values, "lon": one["lon"].values})
+    ind = xr.DataArray(ok.astype("float64"),
+                       dims=("lat", "lon"),
+                       coords={"lat": one["lat"].values,
+                               "lon": one["lon"].values})
 
     # horizontal: MASKED bilinear from half-degree centers to integer label
     # points.  A plain bilinear NaN-poisons every label point with even one

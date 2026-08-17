@@ -196,15 +196,28 @@ def test_build_airs_demo_day(tmp_path, monkeypatch):
 
 
 @needs_demo
-def test_valid_frac_not_capped_at_threshold():
-    """Regression (2026-08-12): an off-bin surface target (1000 hPa) averaged
-    the observed indicator with the always-empty 1015-hPa bin, capping
-    valid_frac at exactly OBSERVED_MIN_FRACTION -- retention survived only by
-    float-equality luck.  At the real 985-hPa bin the interp is exact."""
+def test_terrain_following_surface_covers_elevated_west():
+    """Regression (post-mortem 2026-08-16): the fixed 985-hPa surface target
+    had ZERO coverage over all elevated terrain (the high plains never have
+    985-hPa air), so the dryline region looked permanently out-of-swath.
+    The terrain-following extraction must (a) still saturate valid_frac at
+    1.0 where fully surrounded, and (b) actually observe the elevated west
+    on the demo day, where per-level checks show 62-70% raw coverage."""
+    from dl_front import dataset
+
     path = airs_fcst.find_fullgrid(DEMO_DAY, root=DEMO_ROOT)
-    vf = airs_fcst.period_fields(path, 21)["valid_frac"].values
+    per = airs_fcst.period_fields(path, 21)
+    vf = per["valid_frac"].values
     assert vf.max() == 1.0                     # fully-surrounded pixels exist
     assert (vf > airs_fcst.OBSERVED_MIN_FRACTION).any()
+    domain = dataset.analysis_domain()
+    lons = np.asarray(config.LABEL_LONS)
+    west = domain & (lons[None, :] < -95)
+    obs = vf >= airs_fcst.OBSERVED_MIN_FRACTION
+    assert (obs & west).sum() / west.sum() > 0.3   # was exactly 0.0 pre-fix
+    # extrapolated fields stay physical over the elevated terrain
+    t = per["T2M"].values
+    assert np.nanmin(t[west]) > 230 and np.nanmax(t[west]) < 330
 
 
 @needs_demo
@@ -319,28 +332,93 @@ def test_build_refuses_empty_archive(tmp_path, monkeypatch):
     assert not (tmp_path / "out").exists()      # nothing was written
 
 
-@pytest.mark.skipif(not (config.REPO_ROOT / "data/masks/gap_bank.npz").exists(),
-                    reason="gap bank not on disk")
-def test_build_degraded_refuses_tiny_gap_bank(tmp_path, monkeypatch):
-    """The shipped 1-field bank would give every degraded step the same gap
-    geometry; the builder must fail loudly unless --allow-small-bank."""
-    from front_finder import mask_bank
+def _write_sfc_gap_bank(path, n, rng_seed=0):
+    """A synthetic sfc_gap_bank npz with n fields across months and hours."""
+    import numpy as _np
+    rng = _np.random.default_rng(rng_seed)
+    vf = rng.random((n, *config.GRID_SHAPE)).astype(_np.float16)
+    months = (_np.arange(n) % 12) + 1
+    dates = _np.asarray([f"2016-{m:02d}-15" for m in months])
+    hours = _np.asarray([(21, 0)[i % 2] for i in range(n)])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as fh:
+        _np.savez_compressed(fh, vf=vf, date=dates, hour=hours)
+    return vf, dates, hours
 
-    vf, dates = mask_bank.load_bank()
-    if len(vf) >= mask_bank.MIN_REAL_BANK:
-        pytest.skip("bank is already big enough")
+
+def test_build_degraded_refuses_tiny_gap_bank(tmp_path, monkeypatch):
+    """A tiny surface gap bank would give every degraded step near-identical
+    gap geometry; the builder must fail loudly unless --allow-small-bank."""
+    from dl_front import swath
+
+    bank_path = tmp_path / "sfc_gap_bank.npz"
+    _write_sfc_gap_bank(bank_path, n=3)
+    monkeypatch.setattr(config, "SFC_GAP_BANK_PATH", bank_path)
+    monkeypatch.setattr(swath, "_SFC_GAP_CACHE", {})
     empty_root = tmp_path / "no_archive"
     empty_root.mkdir()
     monkeypatch.setattr(config, "AIRS_FCST_ROOT", empty_root)
-    with pytest.raises(RuntimeError, match="MIN_REAL_BANK"):
-        krige_fill._gap_valid_frac(pd.Timestamp("2010-06-01"), 18,
+    with pytest.raises(RuntimeError, match="SFC_GAP_MIN_BANK"):
+        krige_fill._gap_valid_frac(pd.Timestamp("2010-06-01"), 21,
                                    allow_small_bank=False)
     mask, note, used_bank = krige_fill._gap_valid_frac(
-        pd.Timestamp("2010-06-01"), 18, allow_small_bank=True)
+        pd.Timestamp("2010-06-01"), 21, allow_small_bank=True)
     assert mask.shape == config.GRID_SHAPE
     # a missing fullgrid file is a bank draw and must SAY so (review
     # 2026-08-13): the note quantifies donor-geometry steps downstream
     assert used_bank and "bank mask used" in note
+
+
+def test_column_lapse_recovers_linear_profile():
+    """The LSQ lapse fit must recover a synthetic linear T(z) exactly, fall
+    back on single-bin columns, and clip to the configured bounds."""
+    lev = np.array([805.0, 865.0, 925.0, 985.0])     # ascending pressure
+    alt = np.zeros((4, 1, 3))
+    alt[:, 0, :] = np.array([1800.0, 1200.0, 600.0, 100.0])[:, None]
+    true_lapse = np.array([0.008, 0.008, 0.030])     # K/m; col 2 super-steep
+    t = 300.0 - true_lapse[None, None, :] * alt
+    n = np.ones((4, 1, 3))
+    n[:3, 0, 1] = 0                                  # col 1: deepest bin only
+    one = xr.Dataset(
+        {"alt": (("level", "lat", "lon"), alt),
+         "t": (("level", "lat", "lon"), t),
+         "N": (("level", "lat", "lon"), n)},
+        coords={"level": lev, "lat": [40.0], "lon": [-100.0, -99.0, -98.0]})
+    sub = (n > 0)
+    idx = np.full((1, 3), 3)                          # deepest = last level
+    at_deepest = lambda var: one[var].values[3]
+    lapse = airs_fcst._column_lapse(one, sub, idx, at_deepest)
+    np.testing.assert_allclose(lapse[0, 0], 0.008, rtol=1e-9)   # exact fit
+    assert lapse[0, 1] == pytest.approx(
+        config.AIRS_SURFACE_LAPSE_K_PER_KM / 1000.0)  # fallback: 1 bin
+    hi = config.AIRS_SURFACE_LAPSE_CLIP_K_PER_KM[1] / 1000.0
+    assert lapse[0, 2] == pytest.approx(hi)           # clipped at dry adiabat
+
+
+def test_sfc_gap_bank_sampling_prefers_hour_and_season(tmp_path, monkeypatch):
+    """sample_gap_field prefers same-hour entries within +-1 month, and the
+    missing-bank case raises with the build command in the message."""
+    from dl_front import swath
+
+    bank_path = tmp_path / "sfc_gap_bank.npz"
+    vf, dates, hours = _write_sfc_gap_bank(bank_path, n=48)
+    monkeypatch.setattr(config, "SFC_GAP_BANK_PATH", bank_path)
+    monkeypatch.setattr(swath, "_SFC_GAP_CACHE", {})
+    rng = np.random.default_rng(1)
+    months = np.asarray([int(d[5:7]) for d in dates])
+    for _ in range(20):
+        draw = swath.sample_gap_field(rng, month=6, hour=21)
+        # the draw must be one of the same-hour, month 5-7 fields
+        pool = np.flatnonzero((hours == 21)
+                              & (np.minimum(abs(months - 6),
+                                            12 - abs(months - 6)) <= 1))
+        assert any(np.array_equal(draw, vf[i].astype(np.float32))
+                   for i in pool)
+    monkeypatch.setattr(config, "SFC_GAP_BANK_PATH",
+                        tmp_path / "nope.npz")
+    monkeypatch.setattr(swath, "_SFC_GAP_CACHE", {})
+    with pytest.raises(FileNotFoundError, match="build-bank"):
+        swath.sample_gap_field(rng)
 
 
 # --------------------------------------------------------------------------- #

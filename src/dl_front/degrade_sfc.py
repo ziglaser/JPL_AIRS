@@ -10,11 +10,11 @@ paired forecast fields (FCST files), so stage B degrades only T2M and QV2M:
    (single level, no vertical correlation to model).  Near-surface AIRS
    errors are the worst of the profile: T ~1.5-2 K, q ~20 %+ in the lowest
    2 km (Divakarla et al. 2006 AIRS/AMSU validation).
-2. **Real retrieval-gap masks** -- sampled from the harvested AIRS
-   valid-fraction bank (``front_finder.mask_bank``); the lowest stored
-   level (1000 hPa) proxies the surface gap field.  Gap pixels are imputed
-   to the standardized mean (0.0) and the loss still scores them
-   (workplan 3.4: analyst fronts exist under cloud).
+2. **Real retrieval-gap masks** -- sampled from the terrain-following
+   surface gap bank (``swath.sample_gap_field``, harvested alongside the
+   swath bank; user decision 2026-08-16).  Gap pixels are imputed to the
+   standardized mean (0.0) and the loss still scores them (workplan 3.4:
+   analyst fronts exist under cloud).
 
 Severity in [0, 1] scales the noise sigmas and blends the gap field toward
 all-valid, exactly as the UNET3+ stage B does.
@@ -68,25 +68,17 @@ def degrade_x(x: np.ndarray, rng: np.random.Generator, stats: dict,
     return out
 
 
-def surface_gap_field(bank_vf: np.ndarray, rng: np.random.Generator,
-                      month: int | None = None,
-                      dates: np.ndarray | None = None) -> np.ndarray:
-    """One real (68, 141) surface gap field: the lowest bank level.
+def surface_gap_field(rng: np.random.Generator, month: int | None = None,
+                      hour: int | None = None) -> np.ndarray:
+    """One real (68, 141) surface gap field from the terrain-following bank.
 
-    The bank is harvested by front_finder.ingest_hysplit, whose lowest
-    target level (1000 hPa) sits BETWEEN the fullgrid's 985-hPa bin and the
-    always-empty 1015-hPa bin: the linear vertical interp of the observed
-    indicator is then 0.5 * obs(985), capping the stored valid fraction at
-    0.5 -- exactly the OBSERVED_MIN_FRACTION threshold, which would punch
-    out ~99 % of every field.  A bank-wide max <= 0.5 at the surface level
-    is the unambiguous signature of that halving (a healthy bank always
-    contains fully-surrounded pixels with vf == 1.0 somewhere), so the draw
-    is rescaled by 2 to recover the true 985-hPa availability; a bank
-    harvested after an ingest fix passes through untouched.
+    Draws from ``swath``'s sfc_gap_bank (harvested alongside the swath bank
+    by the SAME terrain-following extraction stage C uses, user decision
+    2026-08-16) -- the retired front_finder gap_bank stored fixed-level
+    (1000 hPa) fields that punched out ALL elevated terrain, so stage B
+    simulated a permanent western void stage C never had.  Season- and
+    hour-conditional sampling lives in :func:`swath.sample_gap_field`.
     """
-    from front_finder import mask_bank
+    from . import swath
 
-    vf = mask_bank.sample_mask(bank_vf, rng, month=month, dates=dates)[..., 0]
-    if float(bank_vf[..., 0].max()) <= 0.5:
-        vf = np.clip(vf * 2.0, 0.0, 1.0)
-    return vf
+    return swath.sample_gap_field(rng, month=month, hour=hour)

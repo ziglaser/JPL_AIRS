@@ -178,6 +178,21 @@ def test_evaluate_case_nearest_copies_boundary_column():
 @needs_2007
 def test_end_to_end_two_days(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "KRIGE_MAX_OBS", 400)   # keep solves fast
+    # 2007 has no local fullgrid files, so every sampled step draws its gap
+    # mask from the surface gap bank -- provide a small synthetic one (the
+    # real bank is harvested on the cluster by swath build-bank)
+    from dl_front import swath as _swath
+    rng_b = np.random.default_rng(7)
+    bank_path = tmp_path / "sfc_gap_bank.npz"
+    with open(bank_path, "wb") as fh:
+        np.savez_compressed(
+            fh,
+            vf=rng_b.random((8, *config.GRID_SHAPE)).astype(np.float16),
+            date=np.asarray([f"2007-{m:02d}-15" for m in
+                             (1, 3, 5, 7, 9, 11, 6, 12)]),
+            hour=np.asarray([21, 0, 21, 0, 21, 0, 21, 0]))
+    monkeypatch.setattr(config, "SFC_GAP_BANK_PATH", bank_path)
+    monkeypatch.setattr(_swath, "_SFC_GAP_CACHE", {})
     out = tmp_path / "krige_validation"
     # a leftover panel from a previous configuration must be cleared, and a
     # user's own file in panels/ must survive (review 2026-08-13)

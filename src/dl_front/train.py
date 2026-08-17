@@ -74,9 +74,6 @@ def make_degraded_tf_dataset(x, y, n_classes, stats, severity, seed,
     """
     import tensorflow as tf
 
-    from front_finder import mask_bank
-
-    bank_vf, bank_dates = mask_bank.load_bank()
     rng = np.random.default_rng(seed)
     _, mask = loss_mask_for(n_classes, "reanalysis", degraded=True)
 
@@ -90,7 +87,7 @@ def make_degraded_tf_dataset(x, y, n_classes, stats, severity, seed,
         order = r.permutation(len(x)) if shuffle else np.arange(len(x))
         for i in order:
             s = severity() if callable(severity) else severity
-            vf = degrade_sfc.surface_gap_field(bank_vf, r)
+            vf = degrade_sfc.surface_gap_field(r)
             yield degrade_sfc.degrade_x(x[i], r, stats, s, vf), y[i]
 
     sig = (tf.TensorSpec((*config.GRID_SHAPE, x.shape[-1]), tf.float32),

@@ -152,6 +152,17 @@ LAND_MASK_PATH = fd.DATA_ROOT / "masks/land_surface_mask.nc"
 #: thresholded into the "expected swath" footprint that splits missing
 #: pixels into swath-boundary vs retrieval (cloud) gaps.
 SWATH_BANK_PATH = fd.DATA_ROOT / "masks/swath_bank.npz"
+#: Static hypsometric terrain map for the terrain-following AIRS surface
+#: extraction (scripts/build_surface_elevation.py; run once per machine --
+#: data/ is gitignored so it doesn't travel with the repo).
+SURFACE_ELEV_PATH = fd.DATA_ROOT / "masks/surface_elevation.nc"
+#: Per-(date, hour) surface valid-fraction bank for stage-B gap-mask
+#: FALLBACK draws (days whose fullgrid is missing/unreadable).  Harvested
+#: terrain-following in the same sweep as the swath bank
+#: (swath.build_swath_bank) -- replaces the front_finder gap_bank, whose
+#: fixed-level (1000 hPa) fields carried the same terrain hole the
+#: 2026-08-16 surface fix removed from stage C.
+SFC_GAP_BANK_PATH = fd.DATA_ROOT / "masks/sfc_gap_bank.npz"
 
 #: gap_type flag values stored in the kriged caches (int8).  Chosen as one
 #: compact ordinal variable (not separate masks) so the CNN can consume it
@@ -198,7 +209,11 @@ TUNABLES = {
     ("degradation", "observed_min_fraction"): "OBSERVED_MIN_FRACTION",
     ("evaluation", "roc_factors"): "ROC_FACTORS",
     ("airs", "hours"): "AIRS_HOURS",
-    ("airs", "surface_level_hpa"): "AIRS_SURFACE_LEVEL_HPA",
+    ("airs", "surface_scan_floor_hpa"): "AIRS_SURFACE_SCAN_FLOOR_HPA",
+    ("airs", "surface_max_agl_m"): "AIRS_SURFACE_MAX_AGL_M",
+    ("airs", "surface_lapse_k_per_km"): "AIRS_SURFACE_LAPSE_K_PER_KM",
+    ("airs", "surface_lapse_derived"): "AIRS_SURFACE_LAPSE_DERIVED",
+    ("airs", "surface_lapse_clip_k_per_km"): "AIRS_SURFACE_LAPSE_CLIP_K_PER_KM",
     ("airs", "kriged_channels"): "KRIGED_CHANNELS",
     ("airs", "swath_min_fraction"): "SWATH_MIN_FRACTION",
     ("domain", "lat_range"): "ANALYSIS_LAT_RANGE",

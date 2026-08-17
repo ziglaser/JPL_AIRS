@@ -109,15 +109,37 @@ airs:
   # (no analyst labels off the 3-hourly grid; interpolating thin-line
   # front positions would reinject label error).
   hours: [21, 0]
-  # Pressure level standing in for the 2-m/10-m surface fields.  The fullgrid
-  # level axis holds 30-hPa BIN CENTERS 115..1075 hPa; the bottom three bins
-  # (1015/1045/1075) are always empty and 985 hPa (~10% coverage over the
-  # swath) is the deepest real retrieval, so 985 is the target (fullgrid
-  # audit 2026-08-12).  Keep this on an actual bin center: a between-bin
-  # value such as 1000 averages the observed indicator with the empty
-  # 1015-hPa bin and caps valid_frac at 0.5 -- exactly the observed_min_
-  # fraction threshold -- collapsing coverage to ~0.9% of the grid.
-  surface_level_hpa: 985
+  # TERRAIN-FOLLOWING surface extraction (user decision 2026-08-16).  The
+  # old fixed surface_level_hpa: 985 structurally excluded all elevated
+  # terrain -- the high plains sit at 1-2 km ASL (surface pressure
+  # ~800-850 hPa), so "N>0 at 985 hPa" was a permanent hard zero west of
+  # ~-95 (the DRYLINE region): the swath-bank "footprint" was a terrain
+  # map, not an orbit map, while per-level checks show the west observed
+  # BETTER than the east at 715-865 hPa.  Now each column's surface value
+  # comes from its DEEPEST finite retrieval bin, gated and adjusted:
+  surface_scan_floor_hpa: 600   # bins above (lower pressure than) this are
+                                # never surface candidates
+  surface_max_agl_m: 1500       # deepest bin must sit within this height of
+                                # the local ground (masks/surface_elevation.nc,
+                                # scripts/build_surface_elevation.py) --
+                                # rejects cloud-blocked columns whose lowest
+                                # retrieval is mid-tropospheric
+  surface_lapse_derived: true   # least-squares T-vs-altitude fit over ALL
+                                # finite bins in the lowest ~2 km above the
+                                # deepest bin (mixed layers are near-linear
+                                # in z, MOST linear on convective days, so
+                                # the multi-bin fit is stable where 2-point
+                                # differencing is retrieval-noise-dominated;
+                                # needs >=2 bins spanning >=400 m, else the
+                                # fallback rate below)
+  surface_lapse_clip_k_per_km: [-3.0, 9.8]  # derived-lapse physical bounds:
+                                # weak inversions .. dry adiabatic
+  surface_lapse_k_per_km: 6.5   # FALLBACK rate (columns with no usable upper
+                                # bin, or surface_lapse_derived: false); T is
+                                # extrapolated from the deepest bin to the
+                                # ground, q held constant, u/v taken from the
+                                # bin unchanged (full MOST needs surface
+                                # fluxes/stability AIRS cannot provide)
   # Channels gap-filled by kriging in the DEGRADED-reanalysis stage.  User
   # decision 2026-08-15 (science audit): winds are masked+kriged too --
   # stage C's builder kriges all four AIRS-derived channels, and leaving

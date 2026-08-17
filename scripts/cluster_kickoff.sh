@@ -29,19 +29,13 @@ NFULL=$(find "$JPL_AIRS_FCST" -name 'fullgrid_*' -type f | wc -l)
 [ "$NFULL" -gt 0 ] || { log "FATAL: no fullgrid_* files under $JPL_AIRS_FCST"; exit 1; }
 log "fullgrid archive: $NFULL files"
 
-BANK="$JPL_AIRS_DATA/masks/gap_bank.npz"
-bank_size(){ python - "$BANK" 2>/dev/null <<'PY' || echo 0
-import sys, numpy as np
-print(len(np.load(sys.argv[1])["date"]))
-PY
-}
-if [ "$(bank_size)" -lt 30 ]; then
-    log "harvesting gap bank from $NFULL fullgrids (this is the slow part)..."
-    python -c "import os; from pathlib import Path; from front_finder import mask_bank; mask_bank.harvest(sorted(Path(os.environ['JPL_AIRS_FCST']).rglob('fullgrid_*')))"
+# (the old front_finder gap-bank harvest step is GONE: stage-B fallback
+# masks now come from masks/sfc_gap_bank.npz, harvested by the chain's own
+# --with-swath-bank phase with the terrain-following extraction, 2026-08-16)
+if [ ! -e "$JPL_AIRS_DATA/masks/surface_elevation.nc" ]; then
+    log "building surface elevation map (terrain-following extraction needs it)..."
+    python scripts/build_surface_elevation.py
 fi
-SZ=$(bank_size)
-[ "$SZ" -ge 30 ] || { log "FATAL: gap bank size $SZ < 30 after harvest"; exit 1; }
-log "gap bank OK: $SZ fields"
 
 # sfc_daily completeness, per year (a bare dir-existence test is repair-blind:
 # acquire creates the year dir before its first download succeeds).  build-airs

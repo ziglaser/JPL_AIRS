@@ -138,6 +138,9 @@ def build_swath_bank(years, hours=None, root=None,
     shape = (CYCLE_DAYS, len(hours), *config.GRID_SHAPE)
     counts = np.zeros(shape, np.int32)
     n_days = np.zeros((CYCLE_DAYS, len(hours)), np.int32)
+    # the SAME sweep also harvests the per-(date, hour) surface gap bank
+    # (stage-B fallback masks) -- one archive pass builds both products
+    gap_vf, gap_date, gap_hour = [], [], []
 
     dates = pd.DatetimeIndex([])
     for year in years:
@@ -163,8 +166,12 @@ def build_swath_bank(years, hours=None, root=None,
                 print(f"{date:%Y-%m-%d} {hour:02d}Z: skipped ({err})",
                       flush=True)
                 continue
-            counts[cyc, h_idx] += observed_mask(period["valid_frac"].values)
+            vf = period["valid_frac"].values
+            counts[cyc, h_idx] += observed_mask(vf)
             n_days[cyc, h_idx] += 1
+            gap_vf.append(vf.astype(np.float16))
+            gap_date.append(f"{date:%Y-%m-%d}")
+            gap_hour.append(hour)
         print(f"{date:%Y-%m-%d}: composited into cycle day {cyc}", flush=True)
 
     freq = counts / np.maximum(n_days[..., None, None], 1)
@@ -182,7 +189,67 @@ def build_swath_bank(years, hours=None, root=None,
     tmp.replace(path)
     print(f"wrote {path}: {int(n_days.sum())} (day, hour) composites, "
           f"cycle-day day counts {n_days.min(1).tolist()}", flush=True)
+
+    gpath = config.SFC_GAP_BANK_PATH
+    gpath.parent.mkdir(parents=True, exist_ok=True)
+    gtmp = gpath.with_name(gpath.name + ".tmp")
+    with open(gtmp, "wb") as fh:
+        np.savez_compressed(
+            fh, vf=np.stack(gap_vf) if gap_vf else
+            np.empty((0, *config.GRID_SHAPE), np.float16),
+            date=np.asarray(gap_date), hour=np.asarray(gap_hour))
+    gtmp.replace(gpath)
+    print(f"wrote {gpath}: {len(gap_vf)} surface gap fields", flush=True)
     return path
+
+
+#: Minimum surface-gap-bank size before stage B trusts it: fewer fields
+#: cannot span seasons or swath geometries, and the degraded curriculum
+#: would memorize a handful of gap patterns (same rationale as the retired
+#: front_finder.mask_bank.MIN_REAL_BANK).
+SFC_GAP_MIN_BANK = 30
+
+_SFC_GAP_CACHE: dict = {}
+
+
+def load_sfc_gap_bank(path: Path = None) -> dict | None:
+    """{vf (n,68,141) f16, date (n) str, hour (n) int} or None if absent."""
+    path = Path(config.SFC_GAP_BANK_PATH if path is None else path)
+    if path not in _SFC_GAP_CACHE:
+        if not path.exists():
+            _SFC_GAP_CACHE[path] = None
+        else:
+            with np.load(path) as z:
+                _SFC_GAP_CACHE[path] = {k: z[k] for k in z.files}
+    return _SFC_GAP_CACHE[path]
+
+
+def sample_gap_field(rng: np.random.Generator, month: int | None = None,
+                     hour: int | None = None,
+                     bank: dict | None = None) -> np.ndarray:
+    """One real (68, 141) surface valid-fraction field from the gap bank.
+
+    Prefers entries at the SAME period hour within +-1 calendar month
+    (seasonal swath/cloud statistics); relaxes to same-hour-any-month, then
+    the whole bank, when the preferred pool is empty.
+    """
+    bank = load_sfc_gap_bank() if bank is None else bank
+    if bank is None or not len(bank["vf"]):
+        raise FileNotFoundError(
+            f"no surface gap bank at {config.SFC_GAP_BANK_PATH}; build it "
+            f"(with the swath bank) via 'python -m dl_front.swath "
+            f"build-bank --years 2007-2021'")
+    idx = np.arange(len(bank["vf"]))
+    hour_ok = (idx if hour is None
+               else idx[bank["hour"][idx] == hour])
+    pool = hour_ok if len(hour_ok) else idx
+    if month is not None and len(pool):
+        months = np.array([int(d[5:7]) for d in bank["date"][pool]])
+        near = pool[np.minimum(np.abs(months - month),
+                               12 - np.abs(months - month)) <= 1]
+        if len(near):
+            pool = near
+    return bank["vf"][rng.choice(pool)].astype(np.float32)
 
 
 _BANK_CACHE: dict[Path, dict | None] = {}

@@ -8,7 +8,7 @@ z-score with the SAME frozen stats as the reanalysis (dataset.kriged_year_arrays
   ordinary kriging of the surviving pixels; SLP/U10M/V10M stay clean.  The
   gap shape for a (date, hour) comes from the real fullgrid file when one
   exists, else from a season-matched draw of the harvested real-gap bank
-  (front_finder.mask_bank).
+  (swath.sample_gap_field, terrain-following since 2026-08-16).
 * ``airs_fcst`` (stage C): real AIRS-FCST surface fields
   (dl_front.airs_fcst.period_fields), ALL four AIRS-derived channels
   kriged over the full label grid; SLP -- which AIRS does not retrieve --
@@ -181,8 +181,6 @@ def _crop() -> np.ndarray:
     return crop_domain()
 
 
-_BANK = None    # (vf, dates) gap-bank cache, loaded once per process
-
 #: A malformed fullgrid file (truncated time axis, all-fill parceltime,
 #: missing variables, HDF read errors, ...) must skip THAT day with a logged
 #: note, never abort a multi-year build (spec: only-absent-file handling is
@@ -214,24 +212,25 @@ def _gap_valid_frac(date: pd.Timestamp, hour: int, allow_small_bank: bool
                     f"{Path(fullgrid).name} ({err}); bank mask used")
     else:
         note = f"{hour:02d}Z: no fullgrid file; bank mask used"
-    global _BANK
-    from front_finder import mask_bank
-
-    from . import degrade_sfc
-    if _BANK is None:
-        _BANK = mask_bank.load_bank()
-    vf, dates = _BANK
-    if len(vf) < mask_bank.MIN_REAL_BANK and not allow_small_bank:
+    from . import degrade_sfc, swath
+    bank = swath.load_sfc_gap_bank()
+    if bank is None:
+        raise FileNotFoundError(
+            f"no surface gap bank at {config.SFC_GAP_BANK_PATH}: the "
+            f"degraded build needs it for missing-fullgrid days.  It is "
+            f"harvested alongside the swath bank -- run 'python -m "
+            f"dl_front.swath build-bank --years 2007-2021' (the chain's "
+            f"--with-swath-bank phase does this).")
+    if len(bank["vf"]) < swath.SFC_GAP_MIN_BANK and not allow_small_bank:
         raise RuntimeError(
-            f"gap bank {mask_bank.BANK_PATH} holds only {len(vf)} field(s) "
-            f"(< MIN_REAL_BANK={mask_bank.MIN_REAL_BANK}): every degraded "
-            f"step would reuse near-identical gap geometry.  Re-harvest it "
-            f"from the JPL fullgrid archive (front_finder.mask_bank.harvest) "
-            f"or pass --allow-small-bank for a smoke test.")
-    # surface_gap_field also corrects the harvested lev-0 halving (see its
-    # docstring), so the degraded masks match airs_fcst.period_fields'
-    mask = degrade_sfc.surface_gap_field(vf, _step_rng(date, hour),
-                                         month=date.month, dates=dates)
+            f"surface gap bank {config.SFC_GAP_BANK_PATH} holds only "
+            f"{len(bank['vf'])} field(s) (< SFC_GAP_MIN_BANK="
+            f"{swath.SFC_GAP_MIN_BANK}): every degraded step would reuse "
+            f"near-identical gap geometry.  Rebuild via 'python -m "
+            f"dl_front.swath build-bank' over the full archive, or pass "
+            f"--allow-small-bank for a smoke test.")
+    mask = degrade_sfc.surface_gap_field(_step_rng(date, hour),
+                                         month=date.month, hour=hour)
     return mask, note, True
 
 
@@ -580,7 +579,7 @@ def main(argv=None) -> None:
                             "(default: skip them and resume)")
         p.add_argument("--allow-small-bank", action="store_true",
                        help="build-degraded only: accept a gap bank smaller "
-                            "than mask_bank.MIN_REAL_BANK (smoke tests)")
+                            "than swath.SFC_GAP_MIN_BANK (smoke tests)")
     args = ap.parse_args(argv)
     hours = (tuple(int(h) for h in args.hours.split(","))
              if args.hours else None)

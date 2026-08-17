@@ -38,11 +38,13 @@ def test_airs_and_kriging_tunables():
     """The frozen AIRS/kriging knobs (interface spec 2026-08-12)."""
     vals = config.load_tunables()
     assert vals["AIRS_HOURS"] == (21, 0)
-    # 985 = the deepest REAL fullgrid bin (30-hPa centers 115..1075): an
-    # off-bin target such as 1000 hPa averages the observed indicator with
-    # the always-empty 1015 bin and caps valid_frac at exactly the 0.5
-    # threshold (bugfix 2026-08-12)
-    assert vals["AIRS_SURFACE_LEVEL_HPA"] == 985
+    # terrain-following surface extraction (user decision 2026-08-16; the
+    # old fixed 985-hPa target had zero coverage over all elevated terrain)
+    assert vals["AIRS_SURFACE_SCAN_FLOOR_HPA"] == 600
+    assert vals["AIRS_SURFACE_MAX_AGL_M"] == 1500
+    assert vals["AIRS_SURFACE_LAPSE_K_PER_KM"] == 6.5
+    assert vals["AIRS_SURFACE_LAPSE_DERIVED"] is True
+    assert vals["AIRS_SURFACE_LAPSE_CLIP_K_PER_KM"] == (-3.0, 9.8)
     assert vals["KRIGED_CHANNELS"] == ("T2M", "QV2M", "U10M", "V10M")
     assert vals["KRIGE_VARIOGRAM"] == "linear"
     assert vals["KRIGE_MAX_OBS"] == 1500

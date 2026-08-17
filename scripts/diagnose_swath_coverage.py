@@ -21,11 +21,41 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 import numpy as np
 import pandas as pd
 
 from dl_front import airs_fcst, config, dataset, swath
+
+
+def _check_env():
+    """Refuse to run against the repo-local data/ fallback: config.py
+    silently resolves DATA_ROOT/AIRS_FCST_ROOT to <repo>/data when
+    JPL_AIRS_DATA/JPL_AIRS_FCST aren't exported in THIS shell (a recurring
+    footgun this session -- env vars set in one shell don't carry to a new
+    one), which would scan the tiny local demo tree instead of the real
+    15-year GPFS archive and produce misleadingly clean/empty results."""
+    missing = [v for v in ("JPL_AIRS_DATA", "JPL_AIRS_FCST")
+              if not os.environ.get(v)]
+    if missing:
+        sys.exit(f"FATAL: {', '.join(missing)} not set in this shell -- "
+                 f"would silently scan {config.REPO_ROOT / 'data'} instead "
+                 f"of the real GPFS archive. Export them first, e.g.:\n"
+                 f"  export JPL_AIRS_DATA=/gpfs/scratch/smap-convection/"
+                 f"AIRS_SMAP_Front_data\n"
+                 f"  export JPL_AIRS_FCST=/gpfs/scratch/smap-convection/"
+                 f"AIRS_FCST_1deg")
+    n_files = len(airs_fcst._archive_index(config.AIRS_FCST_ROOT))
+    print(f"JPL_AIRS_DATA={os.environ['JPL_AIRS_DATA']}")
+    print(f"JPL_AIRS_FCST={os.environ['JPL_AIRS_FCST']} "
+         f"({n_files} fullgrid files indexed)")
+    if n_files < 1000:
+        sys.exit(f"FATAL: only {n_files} fullgrid files found under "
+                 f"AIRS_FCST_ROOT={config.AIRS_FCST_ROOT} -- expected "
+                 f"thousands (the full archive is ~6700 files); this looks "
+                 f"like the wrong root, not real archive sparsity.")
 
 
 def check_bank(west, east):
@@ -60,10 +90,12 @@ def check_raw_overpass(n_sample: int):
         except Exception as err:
             continue
         one = ds.isel(time=0)
-        obs = (one["N"].fillna(0) > 0)
-        target = float(config.AIRS_SURFACE_LEVEL_HPA)
-        obs = (obs.sel(level=target) if target in obs["level"].values
-              else obs.interp(level=target, method="linear")) > 0
+        # any retrieval bin at/below the surface scan floor (the
+        # terrain-following extraction's candidate set, 2026-08-16)
+        obs3d = one["N"].fillna(0) > 0
+        obs = obs3d.sel(level=obs3d["level"]
+                        >= float(config.AIRS_SURFACE_SCAN_FLOOR_HPA)
+                        ).any("level")
         if not bool(obs.any()):
             continue
         native_lon = one["lon"].values          # native half-degree grid
@@ -88,6 +120,7 @@ def main(argv=None):
     ap.add_argument("--n-sample", type=int, default=400)
     a = ap.parse_args(argv)
 
+    _check_env()
     domain = dataset.analysis_domain()
     lons = np.asarray(config.LABEL_LONS)
     west = domain & (lons[None, :] < -95)
