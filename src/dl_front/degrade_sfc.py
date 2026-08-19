@@ -35,19 +35,48 @@ OBSERVED_MIN_FRACTION = config.OBSERVED_MIN_FRACTION
 T2M_NOISE_SIGMA_K = config.T2M_NOISE_SIGMA_K
 Q2M_NOISE_FRAC_SIGMA = config.Q2M_NOISE_FRAC_SIGMA
 
-_IT, _IQ = (config.SFC_VARS.index("T2M"), config.SFC_VARS.index("QV2M"))
+def _tq_indices() -> tuple[int, int]:
+    """Positions of T2M/QV2M on the x channel axis, resolved per call.
+
+    These used to be module-level constants derived from
+    ``config.SFC_VARS``.  That was correct only while the x channel axis WAS
+    ``SFC_VARS``; since the channel-subsetting work the axis is
+    ``config.INPUT_CHANNELS`` (integration 2026-08-18), so a frozen
+    ``SFC_VARS`` index silently addresses the WRONG channel under
+    ``--channels`` -- e.g. ``--channels QV2M,SLP`` would degrade SLP using
+    T2M's noise sigma and QV2M's norm stats, producing plausible-looking
+    but meaningless inputs.  Resolving at call time also means a
+    ``--channels`` applied after import (which is how the CLIs do it) is
+    honoured rather than baked in at module-import time.
+    """
+    ch = config.INPUT_CHANNELS
+    missing = [v for v in ("T2M", "QV2M") if v not in ch]
+    if missing:
+        raise ValueError(
+            f"AIRS-simulator degradation needs {missing} on the model's "
+            f"input channels, but config.INPUT_CHANNELS is "
+            f"{list(ch)} -- degrade_sfc perturbs the retrieved "
+            "temperature/humidity pair and has no meaning without them.  "
+            "Either drop --degraded (and any 'kriged-degraded' source) or "
+            "widen --channels to include T2M,QV2M (or the 'inputs: "
+            "channels:' list in configs/dl_front.yaml).")
+    return ch.index("T2M"), ch.index("QV2M")
 
 
 def degrade_x(x: np.ndarray, rng: np.random.Generator, stats: dict,
               severity: float = 1.0, vf: np.ndarray | None = None
               ) -> np.ndarray:
-    """Degrade standardized inputs x (..., 68, 141, 5) at ``severity``.
+    """Degrade standardized inputs x (..., 68, 141, n_ch) at ``severity``.
+
+    ``n_ch`` is ``len(config.INPUT_CHANNELS)`` -- the channels the MODEL
+    consumes, not the five on-disk ``config.SFC_VARS``.
 
     Noise is applied in physical units (unstandardize -> perturb ->
     restandardize) because the q noise is multiplicative.  ``vf`` is a real
     (68, 141) valid-fraction field; pixels below OBSERVED_MIN_FRACTION are
     imputed to 0.0 (the standardized mean) on the T2M/QV2M channels only.
     """
+    _IT, _IQ = _tq_indices()
     out = np.array(x, dtype=np.float32, copy=True)
     mt, st = stats["T2M"]
     mq, sq = stats["QV2M"]

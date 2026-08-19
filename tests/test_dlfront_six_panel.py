@@ -8,6 +8,15 @@ import pytest
 
 from dl_front import config, dataset, evaluate_test, six_panel
 
+#: ``dataset.analysis_domain()``/``crop_domain()``/``region_mask()``
+#: interpolate the land-fraction mask off disk, so even synthetic tests that
+#: reach them need the data root's mask file.  Skipped, never failed, on
+#: checkouts without a populated data root.
+needs_land_mask = pytest.mark.skipif(
+    not config.LAND_MASK_PATH.exists(),
+    reason=f"land mask {config.LAND_MASK_PATH} not on disk "
+           f"(set JPL_AIRS_DATA to a populated data root)")
+
 N_CLASSES = 6
 
 
@@ -89,6 +98,7 @@ def test_class_cmap_covers_every_class_with_a_distinct_color():
         for i in (1, 3, 5))
 
 
+@needs_land_mask
 def test_mask_outside_nans_pixels_outside_analysis_domain():
     cls = np.zeros(config.GRID_SHAPE, dtype=np.uint8)
     out = six_panel._mask_outside(cls)
@@ -96,3 +106,45 @@ def test_mask_outside_nans_pixels_outside_analysis_domain():
     assert np.isnan(out[~domain]).all()
     assert not np.isnan(out[domain]).any()
     np.testing.assert_array_equal(out[domain], 0.0)
+
+
+@needs_land_mask
+def test_render_places_a_marked_cell_at_its_true_lon_lat(tmp_path, monkeypatch):
+    """Regression (2026-08-17): the panels are FULL 68x141 grids, so imshow
+    must get the full-grid edge extent.  Passing the crop window instead
+    squeezed the whole -171..-31 E grid into it and displaced every front by
+    tens of degrees.  Mark one cell and check the drawn image puts it on its
+    own lon/lat, with the crop window as the visible frame.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from dl_front.quicklook import _window
+
+    lat_i, lon_j = 42, 100                       # 52 N, 71 W on the label grid
+    lat, lon = config.LABEL_LATS[lat_i], config.LABEL_LONS[lon_j]
+    assert dataset.analysis_domain()[lat_i, lon_j], "pick an in-domain cell"
+
+    cls = np.full(config.GRID_SHAPE, N_CLASSES - 1, dtype=np.uint8)
+    cls[lat_i, lon_j] = 0                        # 'cold'
+    blank = np.full(config.GRID_SHAPE, N_CLASSES - 1, dtype=np.uint8)
+
+    captured = []
+    monkeypatch.setattr(plt, "close", lambda fig: captured.append(fig))
+    six_panel.render(pd.Timestamp("2016-04-14"), cls, blank, blank,
+                     blank, blank, blank, N_CLASSES, 0, tmp_path)
+    try:
+        ax = captured[0].axes[0]                 # the met-drawn truth panel
+        image, = ax.images
+        # the cell's own lon/lat must index back to the cell it was set in
+        lo, hi, la_lo, la_hi = image.get_extent()
+        n_lat, n_lon = config.GRID_SHAPE
+        assert int((lon - lo) / (hi - lo) * n_lon) == lon_j
+        assert int((lat - la_lo) / (la_hi - la_lo) * n_lat) == lat_i
+        # ... and the view is the crop window, not the whole label grid
+        crop = _window(dataset.crop_domain())
+        assert ax.get_xlim() == pytest.approx(crop[:2])
+        assert ax.get_ylim() == pytest.approx(crop[2:])
+    finally:
+        for fig in captured:
+            plt.Figure.clf(fig)

@@ -14,6 +14,15 @@ import pytest
 
 from dl_front import config, evaluate_test
 
+#: ``dataset.analysis_domain()``/``crop_domain()``/``region_mask()``
+#: interpolate the land-fraction mask off disk, so even synthetic tests that
+#: reach them need the data root's mask file.  Skipped, never failed, on
+#: checkouts without a populated data root.
+needs_land_mask = pytest.mark.skipif(
+    not config.LAND_MASK_PATH.exists(),
+    reason=f"land mask {config.LAND_MASK_PATH} not on disk "
+           f"(set JPL_AIRS_DATA to a populated data root)")
+
 N_CLASSES = 6
 NONE = N_CLASSES - 1
 #: dummy norm stats: evaluate_ckpt never touches them when a loader is
@@ -56,6 +65,7 @@ class PerfectStub:
         return probs
 
 
+@needs_land_mask
 def test_perfect_prediction_and_output_files(tmp_path):
     pm, scores = evaluate_test.evaluate_ckpt(
         PerfectStub(), [2016, 2017], N_CLASSES, "reanalysis",
@@ -88,6 +98,7 @@ def test_perfect_prediction_and_output_files(tmp_path):
     assert "ckpt" in run and "git_rev" in run and "created" in run
 
 
+@needs_land_mask
 def test_scoring_mask_is_analysis_domain_for_6class():
     """User decision 2026-08-13: EVERY 6-class leg scores over
     dataset.analysis_domain() only.  A 'model' whose predictions are
@@ -118,6 +129,7 @@ def test_scoring_mask_is_analysis_domain_for_6class():
         3 * int(dataset.analysis_domain().sum())
 
 
+@needs_land_mask
 def test_hours_filter_reduces_sample_count():
     """Default AIRS hours (21, 0) keep 2 of the 4 synthetic steps per year."""
     all_hours, airs = PerfectStub(), PerfectStub()
@@ -132,6 +144,7 @@ def test_hours_filter_reduces_sample_count():
     assert airs.n_predicted < all_hours.n_predicted
 
 
+@needs_land_mask
 def test_no_data_after_filter_raises():
     with pytest.raises(RuntimeError, match="no data"):
         evaluate_test.evaluate_ckpt(PerfectStub(), [2016], N_CLASSES,
@@ -156,6 +169,7 @@ def test_parse_years():
     assert evaluate_test.parse_years("2016") == [2016]
 
 
+@needs_land_mask
 def test_keras_model_end_to_end(tmp_path):
     """Untrained 1x1-conv softmax model through the full pipeline (TF only)."""
     tf = pytest.importorskip("tensorflow")
@@ -176,6 +190,7 @@ def test_keras_model_end_to_end(tmp_path):
         "pod", "far", "fb"]
 
 
+@needs_land_mask
 def test_match_source_intersects_time_steps(monkeypatch):
     """Reanalysis runs must score ONLY steps present in the kriged-airs
     cache, so a sparse AIRS archive cannot skew the comparison."""
@@ -202,6 +217,7 @@ def test_match_source_intersects_time_steps(monkeypatch):
     assert stub2.n_predicted == 3
 
 
+@needs_land_mask
 def test_missing_match_cache_fails_loudly(monkeypatch):
     with pytest.raises(FileNotFoundError, match="build-airs --years 1901"):
         evaluate_test.evaluate_ckpt(PerfectStub(), [1901], N_CLASSES,
@@ -270,6 +286,7 @@ def test_bk19_ckpt_combination_rejected():
         evaluate_test.main(["--source", "reanalysis"])
 
 
+@needs_land_mask
 def test_bk19_outputs_skip_paper_json(tmp_path):
     """bk19 leg: stem 'bk19', no paper json, run json notes the skip."""
     pm, scores = evaluate_test.evaluate_ckpt(

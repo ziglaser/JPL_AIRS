@@ -6,6 +6,15 @@ import pytest
 
 from dl_front import config, dataset, degrade_sfc, evaluate
 
+#: ``dataset.analysis_domain()``/``crop_domain()``/``region_mask()``
+#: interpolate the land-fraction mask off disk, so even synthetic tests that
+#: reach them need the data root's mask file.  Skipped, never failed, on
+#: checkouts without a populated data root.
+needs_land_mask = pytest.mark.skipif(
+    not config.LAND_MASK_PATH.exists(),
+    reason=f"land mask {config.LAND_MASK_PATH} not on disk "
+           f"(set JPL_AIRS_DATA to a populated data root)")
+
 
 def _uniform_metrics(n_classes=5):
     pm = evaluate.PaperMetrics(n_classes)
@@ -13,6 +22,7 @@ def _uniform_metrics(n_classes=5):
     return pm
 
 
+@needs_land_mask
 def test_confusion_and_accuracy_analytic():
     pm = _uniform_metrics(5)
     # truth: all none except one cold pixel; prediction: perfect
@@ -33,6 +43,7 @@ def test_confusion_and_accuracy_analytic():
     assert conf.loc["none", "none"] == total - 1
 
 
+@needs_land_mask
 def test_roc_endpoints():
     """factor 0 -> everything front (TPR=FPR=1); huge factor -> nothing."""
     pm = _uniform_metrics(5)
@@ -48,6 +59,7 @@ def test_roc_endpoints():
     assert 0.0 <= pm.auc() <= 1.0
 
 
+@needs_land_mask
 def test_roc_auc_for_perfect_predictor():
     pm = _uniform_metrics(5)
     y = np.full((1, *config.GRID_SHAPE), 4, dtype=np.uint8)
@@ -59,6 +71,7 @@ def test_roc_auc_for_perfect_predictor():
     np.testing.assert_allclose(pm.auc(), 1.0, atol=1e-6)
 
 
+@needs_land_mask
 def test_csi_counts_perfect_prediction():
     times = np.array([np.datetime64("2010-01-01T00")])
     cls = np.full((1, *config.GRID_SHAPE), 4, dtype=np.uint8)

@@ -40,11 +40,33 @@ import codsus_regen as cr  # noqa: E402
 from convection_skill import config  # noqa: E402
 
 # LOCAL TOOLING (manifest reorg 2026-08-13): the raw NOAA XML archive lives
-# only on this machine (front_id/NOAA_USA_fronts, not in the cluster
-# manifest); OUT_DIR is a staging area -- finished years are merged into the
-# canonical front_id/met_drawn_fronts/NOAA_CODSUS/NOAA_1deg_gridded/{w}wide
-# tree that front_finder.labels.load_noaa reads.
-XML_DIR = config.DATA_DIR / "front_id" / "NOAA_USA_fronts"
+# only on this machine (not in the cluster manifest); OUT_DIR is a staging
+# area -- finished years are merged into the canonical
+# front_id/met_drawn_fronts/NOAA_CODSUS/NOAA_1deg_gridded/{w}wide tree that
+# front_finder.labels.load_noaa reads.
+
+
+def _resolve_xml_dir():
+    """Root of the raw NOAA XML analyses, whichever layout is on this disk.
+
+    The archive moved under ``front_id/raw_met_drawn_fronts/`` in a later
+    reorg (found 2026-08-18 while regenerating the labels after the dev data
+    mount was lost), but older checkouts still have it at the flat
+    ``front_id/NOAA_USA_fronts``.  Probe the new location first and fall back,
+    so a rebuild works on either -- and return the new path when NEITHER
+    exists so the error names the canonical location.  ``JPL_AIRS_XML_DIR``
+    overrides both for an archive parked somewhere else entirely.
+    """
+    env = os.environ.get("JPL_AIRS_XML_DIR", "")
+    if env:
+        return Path(env)
+    root = config.DATA_DIR / "front_id"
+    new = root / "raw_met_drawn_fronts" / "NOAA_USA_fronts"
+    old = root / "NOAA_USA_fronts"
+    return old if (old.is_dir() and not new.is_dir()) else new
+
+
+XML_DIR = _resolve_xml_dir()
 OUT_DIR = config.DATA_DIR / "front_id" / "NOAA_to_CODSUS_staging"
 FILE_TEMPLATE = "noaa_fronts_merra2-1deg_{width}wide_{year}.nc"
 
@@ -62,6 +84,49 @@ PGEN_TO_TYPE = {
 }  # TROF / TROPICAL_TROF / INSTABILITY intentionally absent
 
 
+#: Longitude of the grid centre, used to pick a polyline's 360-degree branch.
+_GRID_LON_MID = 0.5 * (cr.GRID_LONS[0] + cr.GRID_LONS[-1])
+
+
+def unwrap_lon(lon: np.ndarray) -> np.ndarray:
+    """Put a polyline's longitudes on ONE continuous 360-degree branch.
+
+    The XML stores every point in [-180, 180], so a front that crosses the
+    antimeridian jumps (e.g. -178.1 -> +174.5).  :func:`cr.rasterize_polyline`
+    strokes in plain lat/lon space with no wrap awareness, so it reads that
+    jump as a 352-degree-long segment and paints a dead-straight horizontal
+    line right across the grid -- the bar that showed up at 33N spanning
+    113W-66W in the 2017-07-25 00Z labels, well inside the analysis domain.
+
+    Unwrapping (each step taken as the shorter of the two ways round) makes
+    the crossing segment run OFF the grid instead, where the rasterizer's
+    bounding-box clip drops it.  The whole polyline is then shifted by the
+    multiple of 360 that lands it nearest the grid, so a front approaching
+    from the far side of the antimeridian (first point at +178, rest in the
+    grid) still gets drawn rather than being pushed off it.
+    """
+    lon = np.asarray(lon, dtype=float)
+    out = np.empty_like(lon)
+    out[0] = lon[0]
+    out[1:] = lon[0] + np.cumsum((np.diff(lon) + 180.0) % 360.0 - 180.0)
+    return out - 360.0 * np.round((out.mean() - _GRID_LON_MID) / 360.0)
+
+
+def split_valid(pts: np.ndarray) -> list[np.ndarray]:
+    """Split a polyline at out-of-range points, dropping them.
+
+    A handful of analyses carry a missing-value sentinel as a Point (e.g.
+    ``Lat="-9999" Lon="10359"`` at 2014-12-14 18Z).  Kept, it drags a segment
+    right off the map -- a wild diagonal before the longitude unwrap and a
+    grid-height vertical stripe after it.  The points on either side belong to
+    the same front but not to the same stroke, so the line is CUT there rather
+    than joined across the gap.
+    """
+    ok = (np.abs(pts[:, 0]) <= 90.0) & (np.abs(pts[:, 1]) <= 180.0)
+    return [run for run in np.split(pts, np.nonzero(np.diff(ok))[0] + 1)
+            if np.abs(run[0, 0]) <= 90.0 and np.abs(run[0, 1]) <= 180.0]
+
+
 def parse_xml(xml_path: str) -> list[tuple[str, np.ndarray]]:
     """One XML analysis -> [(type, polyline (n,2) lat/lon), ...]."""
     root = ET.parse(xml_path, parser=ET.XMLParser(encoding="utf-8")).getroot()
@@ -72,8 +137,12 @@ def parse_xml(xml_path: str) -> list[tuple[str, np.ndarray]]:
             continue
         pts = np.array([(float(p.get("Lat")), float(p.get("Lon")))
                         for p in line.iter("Point")])
-        if len(pts):
-            fronts.append((ftype, pts))
+        if not len(pts):
+            continue
+        for run in split_valid(pts):
+            run = run.copy()
+            run[:, 1] = unwrap_lon(run[:, 1])
+            fronts.append((ftype, run))
     return fronts
 
 
@@ -95,7 +164,10 @@ def rasterize_analysis(fronts: list, width: int,
 
 def build_year(year: int, widths: tuple[int, ...] = (1, 3)) -> None:
     files = {}
-    for path in glob.glob(str(XML_DIR / f"pres*_{year}*f000.xml")):
+    # the archive is nested year/month/day (it was flat when this first
+    # ran); match both layouts so a rebuild finds every analysis
+    pattern = str(XML_DIR / "**" / f"pres*_{year}*f000.xml")
+    for path in glob.glob(pattern, recursive=True):
         stamp = os.path.basename(path).split("_")[-1].split(".")[0].split("f")[0]
         files[pd.Timestamp(f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} "
                            f"{stamp[8:10]}:00")] = path

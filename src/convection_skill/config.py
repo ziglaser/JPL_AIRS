@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
@@ -12,9 +13,22 @@ import yaml
 # Paths
 # --------------------------------------------------------------------------- #
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
-DATA_DIR: Path = REPO_ROOT / "data"
-RESULTS_DIR: Path = REPO_ROOT / "results"
-LSM_PATH: Path = DATA_DIR / "lsm.nc"
+#: Data root, overridable exactly like ``front_finder.config.DATA_ROOT`` and
+#: ``dl_front.config`` (2026-08-18): the same ``JPL_AIRS_DATA`` export now
+#: configures all three packages, so one variable moves the whole suite
+#: between the cluster tree (/gpfs/scratch/smap-convection/AIRS_SMAP_Front_data)
+#: and a development copy off the repo (this machine keeps it on D:,
+#: /mnt/d/JPL_AIRS/data).  Was hard-wired to REPO_ROOT/"data".
+DATA_DIR: Path = Path(os.environ.get("JPL_AIRS_DATA", REPO_ROOT / "data"))
+RESULTS_DIR: Path = Path(os.environ.get("JPL_AIRS_RESULTS",
+                                        REPO_ROOT / "results"))
+#: Land-sea mask read by data_loading.load_land_fraction_grid: the ``lsm``
+#: fraction on 1-deg half-degree centers, which coincide EXACTLY with the
+#: FCST_SMAP_MRMS grid.  FIXED 2026-08-18: this pointed at a bare
+#: DATA_DIR/"lsm.nc" that has never existed in the post-2026-08-13 manifest
+#: tree, so load_land_fraction_grid raised FileNotFoundError and NO base
+#: table could be built at all -- not a cosmetic path move.
+LSM_PATH: Path = DATA_DIR / "masks" / "land_surface_mask.nc"
 YEAR_FILE_TEMPLATE: str = "FCST_SMAP_MRMS/FCST_SMAP_MRMS_{year}.nc"
 
 # --------------------------------------------------------------------------- #

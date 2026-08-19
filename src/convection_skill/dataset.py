@@ -53,8 +53,11 @@ from .gini import exceedance_flags  # noqa: F401  (re-export for interactive use
 #: (hypothesis_tests table v5 + mu_el, mu_cape_overpass, qpe_wet); v7 = hail
 #: counted as CONVECTIVE in the precip-mode fractions (Zach 2026-07-23);
 #: v8 = Mark's screen columns (alt_max, dry_start_qpe, valid7);
-#: v9 = CODSUS surface-front flags (front_{type}_{1,3}w; fronts.py; NaN 2019+).
-DATASET_VERSION: int = 9
+#: v9 = CODSUS surface-front flags (front_{type}_{1,3}w; fronts.py; NaN 2019+);
+#: v10 = rebuild after the front-loader path fix: v9 tables were built while
+#: the front columns were silently all-NaN (FRONTS_DIR pointed at a deleted
+#: path 2026-08-13..2026-08-18).
+DATASET_VERSION: int = 10
 CACHE_DIR = config.RESULTS_DIR / "suite" / "cache"
 
 #: Slot-level variables (file name -> table name). The union of the paper

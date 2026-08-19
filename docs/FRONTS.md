@@ -35,6 +35,37 @@ Alignment decisions (both in `fronts.py`):
 In the cell-day wide table (`to_cell_days`) they widen to
 `front_*_h1..h6`, which is how they enter the random forests.
 
+### Stale label path (fixed 2026-08-18) — cached results at v9 are void
+
+The manifest reorg 2026-08-13 moved the gridded fronts under
+`data/front_id/met_drawn_fronts/`, but `fronts.py` still pointed at the old
+`data/fronts/CODSUS_netCDF_MERRA2_2003-2018/` (and `data/fronts/CODSUS_regen/`)
+and its missing-file fallback is a silent `continue` — so **every front column
+came out all-NaN** from that date until the fix. `FRONTS_DIR` /
+`REGEN_FRONTS_DIR` now *import* `front_finder.config.CODSUS_DIR` (plus new
+`NOAA_FRONTS_DIR` = `NOAA_LABELS_DIR`, the 6-class NOAA product **with
+drylines**), so both packages resolve one tree and honour `$JPL_AIRS_DATA`.
+Consequence: any `DATASET_VERSION = 9` cached table, and every F1-F5 /
+stratifier / RF number computed from one after 2026-08-13, must be
+**recomputed** with a bumped `DATASET_VERSION`, not re-read.
+
+### Front flags on the FCST_SMAP_MRMS files (2026-08-18)
+
+`scripts/add_front_flags.py` writes the same flags straight into copies of the
+`FCST_SMAP_MRMS_<year>.nc` cubes (copy + netCDF4 append, no re-encode of any
+primary byte): `front_{cold,warm,stationary,occluded,dryline,any}_{1,3}w` from
+one `--label-source {noaa,wpc}`, and `pred_front_*_3w` +
+`pred_front_valid_frac` from a model archive under
+`data/front_id/predicted_fronts/<tag>/` (see that README). It calls the same
+`fronts.file_front_flags` the base table uses, so the variables are the
+columns above by construction (verified bit-equal on real 2018 data). `any` is
+always the max over the four types every source has — **dryline excluded**, so
+the column means the same thing in every file; `np.fmax` it with the dryline
+variable if you want it in. The `pred_` prefix keeps model output out of
+`fronts.front_columns()` so predictions can never silently substitute for
+analyst fronts in the pre-registered F-specs. Cluster commands: §11 of
+`docs/JPL_DEPLOYMENT_DLFRONT.md`.
+
 ## Hypothesis tests
 
 Registry ids `F1_any`, `F1_any_1w`, `F2_cold`, `F3_stationary`, `F4_warm`,

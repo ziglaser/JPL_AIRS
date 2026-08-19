@@ -15,6 +15,13 @@ Kriged-cache variants (dl_front.krige_fill output; decision 2026-08-12):
 ``--source kriged-degraded`` / ``--source kriged-airs`` swap the input
 fields for the gap-filled caches (same years, same fold split), and
 ``--hours 18,21,0`` restricts training to the AIRS-covered label hours.
+
+Channel ablation (user decision 2026-08-18): ``--channels T2M,QV2M`` trains
+on a NAMED SUBSET of the on-disk surface variables.  Only T2M/QV2M carry
+AIRS information -- U10M/V10M are the WRF-27km driving winds and SLP is
+copied clean from MERRA-2 -- so the stage-A ladder 5 -> T2M,QV2M,SLP ->
+T2M,QV2M measures how much front skill survives an AIRS-only input set.
+The resolved list is written into the checkpoint's run_config.yaml.
 """
 from __future__ import annotations
 
@@ -64,6 +71,54 @@ def loss_mask_for(n_classes: int, source: str, degraded: bool = False
     return "analysis_domain", dataset.analysis_domain().astype(np.float32)
 
 
+def label_provenance(years, n_classes: int) -> dict:
+    """Which front labels this run TRAINED on -> run_config.yaml fields.
+
+    Why this exists: the labels were regenerated in
+    place on 2026-08-17 (antimeridian polyline bug), and ``_run.json``
+    already records ``labels_sha1`` so a NUMBER can be traced to the label
+    content it was scored against.  A MODEL had no such field: after a
+    FORCE_EVAL=1 re-score the D6A/B/C checkpoints keep their PRE-FIX
+    training while their metrics are recomputed on clean labels, so a fold
+    retrained on clean labels and a fold left over from the buggy ones look
+    identical on disk and their CSIs get pooled into one comparison column.
+    Recording the digest next to the weights is what separates them.
+
+    The digest is over the TRAINING years actually used (``years`` as
+    passed to :func:`run` after the ``--smoke`` truncation), NOT the
+    evaluation years: what a checkpoint's weights depend on is the labels
+    it fit, and the eval span is already fingerprinted in ``_run.json``.
+
+    It is a CONTENT digest (:func:`dataset.label_digest` -- per-class cell
+    counts over the scored steps and mask), not a hash of the label files:
+    it moves iff the labels move where they matter, and is a staleness
+    detector, not a security control.
+
+    NEVER fatal: a provenance field must not be the reason an overnight
+    training job dies, so a missing/unreadable label tree writes
+    ``labels_sha1: null`` plus a ``labels_note`` saying why, and training
+    proceeds (the load of those same labels a few lines later will raise
+    the real, informative error if they are genuinely absent).
+    """
+    prov = {"labels_years": [int(y) for y in years],
+            "labels_sha1": None, "labels_dir": None}
+    try:
+        # same resolution the _run.json uses, so the two fields are
+        # comparable byte-for-byte without a second convention
+        from .evaluate_test import labels_dir
+
+        prov["labels_dir"] = str(labels_dir(n_classes))
+        prov["labels_sha1"] = dataset.label_digest(years, n_classes)
+    except Exception as exc:                       # noqa: BLE001 - see above
+        prov["labels_note"] = (
+            f"digest unavailable ({type(exc).__name__}: {exc}); training "
+            f"continued.  Recompute later with: PYTHONPATH=src python -m "
+            f"dl_front.evaluate_test label-digest --classes {n_classes} "
+            f"--years {int(years[0])}-{int(years[-1])}")
+        print(f"warning: {prov['labels_note']}", file=sys.stderr)
+    return prov
+
+
 def make_degraded_tf_dataset(x, y, n_classes, stats, severity, seed,
                              batch_size=config.BATCH_SIZE, shuffle=True):
     """Stage-B pipeline: noise + real gap masks resampled every pass.
@@ -109,30 +164,76 @@ def run(name: str, n_classes: int, fold: int = 0,
         patience: int = config.PAPER_PATIENCE, retrain: str | None = None,
         batch_size: int = config.BATCH_SIZE, degraded: bool = False,
         finetune_glob: str | None = None, smoke: bool = False,
-        source: str = "reanalysis", hours: tuple | None = None) -> Path:
+        source: str = "reanalysis", hours: tuple | None = None,
+        channels: tuple | None = None) -> Path:
+    """Train one stage and return its checkpoint directory.
+
+    ``channels``: the resolved model input channels, for provenance only --
+    :func:`main` has already installed them with
+    ``config.set_input_channels`` BEFORE any data is loaded (the subset has
+    to be in force by the time dataset.sfc_x stacks the channel axis).
+    Passing None records the config/YAML value in force.
+    """
     import tensorflow as tf
 
     out = config.RESULTS_DIR / "models" / name
     out.mkdir(parents=True, exist_ok=True)
+    # <name>_final.h5 is the done-marker the chain scripts key on
+    # (skip_train, and the ablation chain's permutation-readiness gate): its
+    # existence must mean "the CURRENT weights finished training".  Delete a
+    # leftover from a previous run of this name up front; it is re-created
+    # by the m.save() at the end iff fit() completes.
+    (out / f"{name}_final.h5").unlink(missing_ok=True)
+    # Likewise CSVLogger(append=True) would splice this run's curve onto a
+    # previous same-name run's; rotate the old file aside so history.csv
+    # always holds exactly one training curve.  (There is no
+    # resume-in-place flow to preserve -- --retrain warm-starts from an
+    # EXTERNAL checkpoint and fit() runs once per invocation.)
+    hist = out / "history.csv"
+    if hist.exists():
+        hist.replace(out / "history.prev.csv")
     # Provenance: freeze the run's resolved tunables + call arguments next to
     # the weights, so a checkpoint is reproducible even after the tracked
     # YAML (or a JPL_DLFRONT_CONFIG override) changes.
     import yaml as _yaml
 
     mask_name, loss_mask = loss_mask_for(n_classes, source, degraded)
+    # Resolved BEFORE the yaml is written so the
+    # provenance names the years the run really fits, --smoke truncation
+    # included, rather than the full configured span.
+    years = train_years(n_classes)
+    if smoke:
+        years = years[:1]
+    # config.load_tunables() re-READS the YAML, so a --channels override
+    # would not appear in the snapshot; overwrite INPUT_CHANNELS with the
+    # value actually in force (user decision 2026-08-18).  The list is
+    # recorded TWICE on purpose -- as run_args.channels (what the operator
+    # asked for, which evaluate_test adopts automatically) and inside
+    # tunables (what the model was built from) -- so a checkpoint directory
+    # is self-describing and a future reader never has to guess what its
+    # inputs were.  Both are plain lists, not tuples, to keep the YAML clean.
+    tunables = {k: list(v) if isinstance(v, tuple) else v
+                for k, v in config.load_tunables().items()}
+    channels = tuple(channels) if channels else tuple(config.INPUT_CHANNELS)
+    tunables["INPUT_CHANNELS"] = list(channels)
     (out / "run_config.yaml").write_text(_yaml.safe_dump(
         {"tunables_from": str(config.CONFIG_YAML),
          # which per-pixel loss-weight mask this run trained under
          # (user decision 2026-08-13; see loss_mask_for)
          "loss_mask": mask_name,
-         "tunables": {k: list(v) if isinstance(v, tuple) else v
-                      for k, v in config.load_tunables().items()},
+         # WHICH LABELS THIS CHECKPOINT WAS TRAINED ON (see
+         # label_provenance): top level, next to loss_mask rather than
+         # buried in run_args, because it is a property of the fitted
+         # weights and not of the operator's command line.
+         **label_provenance(years, n_classes),
+         "tunables": tunables,
          "run_args": {"name": name, "n_classes": n_classes, "fold": fold,
                       "lr": lr, "epochs": epochs, "patience": patience,
                       "retrain": retrain, "batch_size": batch_size,
                       "degraded": degraded, "finetune_glob": finetune_glob,
                       "smoke": smoke, "source": source,
-                      "hours": list(hours) if hours is not None else None}},
+                      "hours": list(hours) if hours is not None else None,
+                      "channels": list(channels)}},
         sort_keys=False))
     stats = dataset.load_norm_stats()
     extra_callbacks = []
@@ -149,9 +250,6 @@ def run(name: str, n_classes: int, fold: int = 0,
             "stage C runs on the JPL laptop once the AIRS surface ingest "
             "lands; see docs/DLFRONT_WORKPLAN.md section 4")
 
-    years = train_years(n_classes)
-    if smoke:
-        years = years[:1]
     if source == "reanalysis":
         x, y, times = dataset.stack_years(years, n_classes, stats)
     elif source in config.KRIGED_SOURCE_DIRS:
@@ -247,8 +345,25 @@ def main(argv=None):
     ap.add_argument("--hours", default=None,
                     help="comma-separated UTC label hours to train on, "
                          "e.g. '18,21,0' (default: all label hours)")
+    ap.add_argument("--channels", default=None,
+                    help="comma-separated MODEL input channels, a subset of "
+                         f"{','.join(config.SFC_VARS)} (default: the "
+                         "'inputs: channels:' list in configs/dl_front.yaml, "
+                         "currently "
+                         f"{','.join(config.INPUT_CHANNELS)}).  Order is "
+                         "irrelevant -- it is normalised to SFC_VARS order. "
+                         "Channel-ladder rungs: --channels T2M,QV2M,SLP and "
+                         "--channels T2M,QV2M (AIRS-only thermodynamics)")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args(argv)
+    # BEFORE any data loading or model construction: dataset.sfc_x stacks
+    # config.INPUT_CHANNELS and model.build sizes its input from it, so the
+    # subset has to be installed first (user decision 2026-08-18).  Going
+    # through set_input_channels (not a bare attribute assignment) is what
+    # validates the names and fixes the channel order.
+    channels = config.INPUT_CHANNELS
+    if a.channels is not None:
+        channels = config.set_input_channels(a.channels.split(","))
     if a.degraded and a.source != "reanalysis":
         ap.error(f"--degraded applies the stage-B noise+gap degradation on "
                  f"top of the already-kriged '{a.source}' inputs -- no "
@@ -267,7 +382,7 @@ def main(argv=None):
                       if a.source == "kriged-airs" else config.PAPER_PATIENCE)
     out = run(a.name, a.classes, a.fold, a.lr, a.epochs, a.patience,
               a.retrain, a.batch, a.degraded, a.finetune_glob, a.smoke,
-              a.source, hours)
+              a.source, hours, channels)
     print(f"model saved under {out}")
 
 

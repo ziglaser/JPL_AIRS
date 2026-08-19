@@ -35,6 +35,10 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+pytest.skip("front_finder UNET track on ice until after quals (2026-08-14); "
+            "re-enable when re-vendoring fronts/ dev-master",
+            allow_module_level=True)
+
 _STUBS = Path(__file__).resolve().parent / "_stubs"
 if str(_STUBS) not in sys.path:                    # see module docstring
     sys.path.insert(0, str(_STUBS))

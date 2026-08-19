@@ -49,15 +49,25 @@ def masked_accuracy(y_true, y_pred):
     return tf.reduce_sum(hit * pix_w) / tf.maximum(tf.reduce_sum(pix_w), 1.0)
 
 
-def build(n_classes: int, n_channels: int = len(config.SFC_VARS),
+def build(n_classes: int, n_channels: int | None = None,
           learning_rate: float = config.LEARNING_RATE):
     """Compiled DL-FRONT CNN for (68, 141, n_channels) inputs.
 
     ~340k parameters at 5 classes -- the paper's exact architecture, so no
-    size adaptation is needed for the GTX 1070.  ``n_channels`` grows by one
-    when an input-validity channel is appended for the AIRS-degraded stages
-    (replication runs use exactly the paper's 5).
+    size adaptation is needed for the GTX 1070.
+
+    ``n_channels`` defaults to ``len(config.INPUT_CHANNELS)`` -- the set of
+    surface variables the model consumes, which since the channel-ladder
+    work (user decision 2026-08-18) can be a NAMED SUBSET of the on-disk
+    five (config.SFC_VARS).  Resolved at call time, not at import, so a
+    ``config.set_input_channels`` call from a CLI lands here.  Pass it
+    explicitly to override -- train.py passes ``x.shape[-1]``, which also
+    covers the AIRS-degraded stages if an input-validity channel is ever
+    appended.
     """
+    if n_channels is None:
+        n_channels = len(config.INPUT_CHANNELS)
+
     import tensorflow as tf
     from tensorflow.keras import layers
 

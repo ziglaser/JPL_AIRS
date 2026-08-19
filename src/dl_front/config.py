@@ -38,7 +38,29 @@ RESULTS_DIR = Path(os.environ.get("JPL_AIRS_RESULTS",
 # --------------------------------------------------------------------------- #
 #: Channel order fixed as in the paper's Fig. 1 caption (temperature,
 #: humidity, pressure, u-wind, v-wind).
+#:
+#: THIS IS THE ON-DISK SCHEMA: every ``sfc_daily`` day file and every kriged
+#: cache stores exactly these five variables, and acquire_merra2_sfc /
+#: krige_fill are written against it.  It is NOT the set of channels the
+#: model consumes -- see :data:`INPUT_CHANNELS`.
 SFC_VARS = ("T2M", "QV2M", "SLP", "U10M", "V10M")
+#: The channels the MODEL consumes, always a subset of :data:`SFC_VARS` in
+#: SFC_VARS order.  Default = all five (the paper replication).
+#:
+#: Why this exists (user decision 2026-08-18): only T2M and QV2M carry AIRS
+#: information.  U10M/V10M are the WRF-27km winds that drive HYSPLIT and SLP
+#: is copied clean from MERRA-2 ("AIRS retrieves no SLP", krige_fill), so a
+#: 5-channel score is not an AIRS-only score.  Making the model's input set
+#: configurable lets the stage-A channel ladder (5 -> T2M,QV2M,SLP ->
+#: T2M,QV2M) measure how much front skill survives when the model is
+#: restricted to what AIRS actually provides, without touching the on-disk
+#: files or the frozen norm stats (which keep all five keys -- subsetting is
+#: by NAME, so the JSON needs no rewrite).
+#:
+#: Set it through :func:`set_input_channels` (or the ``inputs.channels`` YAML
+#: key / the ``--channels`` CLI flag), never by assigning this attribute:
+#: the setter is what validates the names and enforces SFC_VARS order.
+INPUT_CHANNELS = SFC_VARS
 SFC_DIR = fd.MERRA2_DIR / "sfc_daily"
 NORM_STATS_PATH = fd.MERRA2_DIR / "sfc_norm_stats.json"
 #: 3-hourly sampling of the hourly collection (section 3.1: "3-hourly
@@ -115,6 +137,30 @@ def _resolve_airs_fcst_root() -> Path:
 
 
 AIRS_FCST_ROOT = _resolve_airs_fcst_root()
+
+#: Kriged-cache file schema.  ``KRIGE_SCHEMA_VERSION`` is what the builder
+#: stamps; ``KRIGE_SCHEMA_READABLE`` is what the loader will READ.
+#:
+#: v3 and v4 have the IDENTICAL on-disk layout (same variables, dims, crop
+#: domain and gap_type semantics) -- v4 differs only in that its U10M/V10M
+#: are clean reanalysis rather than kriged fills (winds decision
+#: 2026-08-18).  That is a per-CHANNEL provenance difference, not a format
+#: difference, so refusing every v3 file outright would force a multi-hour
+#: rebuild even for a run that never reads the winds (user correction
+#: 2026-08-18: "only reducing the number of kriged variables is backwards
+#: compatible").  The loader reads both and lets the per-channel
+#: ``kriged_channels`` guard decide, which accepts a v3 cache for a
+#: T2M/QV2M(/SLP) model and refuses it for one that consumes the winds.
+#:
+#: v1 (kriged over the full grid, no gap_type) and v2 (old region-mask
+#: domain) are genuine FORMAT breaks and stay unreadable.
+KRIGE_SCHEMA_VERSION = 4
+KRIGE_SCHEMA_READABLE = (3, 4)
+#: The kriged split a legacy cache carries implicitly, for versions written
+#: before the ``kriged_channels`` attr existed.  v3 kriged every channel the
+#: AIRS fullgrid supplies (airs_fcst.CHANNEL_MAP = T2M/QV2M/U10M/V10M) and
+#: copied only SLP clean.
+KRIGE_LEGACY_KRIGED_CHANNELS = {3: ("T2M", "QV2M", "U10M", "V10M")}
 #: Kriged gap-filled surface caches (dl_front.krige_fill), one
 #: ``kriged_sfc_{year}.nc`` per year in PHYSICAL units, keyed by the
 #: training/eval ``--source`` value (manifest reorg 2026-08-13, replacing the
@@ -184,6 +230,7 @@ CONFIG_YAML = Path(os.environ.get("JPL_DLFRONT_CONFIG",
 #: The full tunable inventory: (yaml section, yaml key) -> module constant.
 #: Sources and rationale for every value are documented in the YAML itself.
 TUNABLES = {
+    ("inputs", "channels"): "INPUT_CHANNELS",
     ("model", "n_conv_layers"): "N_CONV_LAYERS",
     ("model", "n_filters"): "N_FILTERS",
     ("model", "kernel_size"): "KERNEL_SIZE",
@@ -263,7 +310,58 @@ def load_tunables(path: Path | str = None) -> dict:
     return out
 
 
+def set_input_channels(names) -> tuple:
+    """Validate + install the model's input channels -> the resolved tuple.
+
+    The one supported way to change :data:`INPUT_CHANNELS` (new
+    2026-08-18, for the stage-A channel ladder).  Accepts any iterable of
+    channel names -- a CLI ``--channels T2M,QV2M`` split, or the
+    ``inputs.channels`` YAML list -- and:
+
+    * rejects an empty set, an unknown name, or a duplicate, naming the
+      offending values and listing the legal ones (a typo'd channel would
+      otherwise silently train a model on the wrong inputs, and the only
+      later symptom is a plausible-but-wrong CSI number);
+    * normalises to :data:`SFC_VARS` ORDER, so the channel axis of every x
+      array -- and therefore a checkpoint's weights -- never depends on the
+      order the operator happened to type the flag in.
+
+    Callers (train.py, evaluate_test.py, permutation.py) must go through
+    this rather than assigning ``config.INPUT_CHANNELS`` by hand.
+    """
+    got = tuple(str(n).strip() for n in names)
+    legal = ", ".join(SFC_VARS)
+    if not got:
+        raise ValueError(
+            f"input channels is empty; the model needs at least one of "
+            f"{legal}.  Set it with --channels T2M,QV2M (train.py / "
+            f"evaluate_test.py / permutation.py) or the 'inputs: channels:' "
+            f"list in configs/dl_front.yaml.")
+    bad = [n for n in got if n not in SFC_VARS]
+    dupes = sorted({n for n in got if got.count(n) > 1})
+    problems = []
+    if bad:
+        problems.append(f"unknown channel(s) {bad}")
+    if dupes:
+        problems.append(f"duplicate channel(s) {dupes}")
+    if problems:
+        raise ValueError(
+            f"{'; '.join(problems)} in input channels {list(got)} -- the "
+            f"model's inputs must be a subset of the on-disk surface schema "
+            f"config.SFC_VARS ({legal}).  Fix the --channels flag (e.g. "
+            f"--channels T2M,QV2M) or the 'inputs: channels:' list in "
+            f"configs/dl_front.yaml.")
+    resolved = tuple(v for v in SFC_VARS if v in got)
+    globals()["INPUT_CHANNELS"] = resolved
+    return resolved
+
+
 globals().update(load_tunables())
+# The YAML lands via globals().update, which bypasses every check in
+# set_input_channels -- so re-install inputs.channels through the setter to
+# validate and re-order it (a typo in the YAML must fail at import, not at
+# the first np.stack; review 2026-08-18).
+INPUT_CHANNELS = set_input_channels(INPUT_CHANNELS)
 
 #: Per-variable normalization is not described in the paper (raw SLP ~1e5 Pa
 #: cannot train against T ~3e2 K); standardization to zero mean / unit

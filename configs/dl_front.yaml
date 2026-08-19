@@ -17,6 +17,27 @@
 # fail loudly at import.
 # =============================================================================
 
+# Model INPUT channels (user decision 2026-08-18).  Not to be confused with
+# config.SFC_VARS, which is the ON-DISK schema of the sfc_daily and kriged
+# cache files and never changes: this is the subset of those variables the
+# CNN actually consumes.  It must be a subset of SFC_VARS and is always
+# re-ordered into SFC_VARS order, so a checkpoint's channel axis never
+# depends on the order written here.
+#
+# The default below is all five — the paper replication.  The point of the
+# knob is the stage-A channel ladder: only T2M and QV2M carry AIRS
+# information (U10M/V10M are the WRF-27km driving winds and SLP is copied
+# clean from MERRA-2, since AIRS retrieves no SLP), so
+#   [T2M, QV2M, SLP]  and  [T2M, QV2M]
+# are the rungs that measure how much front skill survives when the model
+# sees only what AIRS provides.  Run those from
+# scripts/dlfront_ablation_chain.sh, or per run with
+#   PYTHONPATH=src python -m dl_front.train --name D6A2 --channels T2M,QV2M
+# (--channels overrides this list; the resolved value is recorded in the
+# checkpoint's run_config.yaml).
+inputs:
+  channels: [T2M, QV2M, SLP, U10M, V10M]
+
 model:
   n_conv_layers: 3      # section 3.1: three conv+ReLU+dropout layers before the
                         # softmax head (layer count was hyperparameter-searched)
@@ -36,11 +57,18 @@ training:
                         # cluster GPUs (decision 2026-08-14; was 32 for the
                         # GTX 1070). lr kept at the paper's 1e-4 — inside its
                         # reported 5e-5..5e-4 insensitive range at this batch
-  max_epochs: 600       # paper trained "for 1200 epochs" (folds stopped at
-                        # 1136-1142 under the patience rule below); capped at
-                        # 600 for wall-clock (user decision 2026-08-15 --
-                        # briefly 1200 on 2026-08-14; NOTE this stops short
-                        # of where the paper's folds converged)
+  max_epochs: 1200      # paper trained "for 1200 epochs" (folds stopped at
+                        # 1136-1142 under the patience rule below).  Back to
+                        # the paper's figure (user decision 2026-08-18): the
+                        # 600 cap (2026-08-15, for wall-clock) was BINDING --
+                        # D6A/D6B took their best epoch at 566-596 of 600 and
+                        # the patience rule below never fired, so neither
+                        # stage converged by its own criterion.  Gains past
+                        # 600 are marginal (~0.0005 val_loss/100 epochs) but
+                        # the run now ends where early stopping says, not
+                        # where the cap does; budget ~2x the stage-A/B
+                        # wall-clock (48h train reservation, see
+                        # docs/JPL_DEPLOYMENT_DLFRONT.md).
   patience: 100         # "Training stopped when the loss did not improve for
                         # 100 epochs" (early stopping on val_loss)
   n_folds: 3            # section 4.1: 3-fold cross-validation, each fold
@@ -140,14 +168,23 @@ airs:
                                 # ground, q held constant, u/v taken from the
                                 # bin unchanged (full MOST needs surface
                                 # fluxes/stability AIRS cannot provide)
-  # Channels gap-filled by kriging in the DEGRADED-reanalysis stage.  User
-  # decision 2026-08-15 (science audit): winds are masked+kriged too --
-  # stage C's builder kriges all four AIRS-derived channels, and leaving
-  # winds clean in stage B taught the network to lean on the one channel
-  # family stage C then corrupts hardest (kriged 985-hPa winds arrive with
-  # ~+1.4/+2.1 m/s mean shifts and roughly halved variance vs the frozen
-  # 10-m stats).  Only SLP stays clean reanalysis in both stages.
-  kriged_channels: [T2M, QV2M, U10M, V10M]
+  # Channels gap-filled by kriging, in BOTH the degraded-reanalysis (stage B')
+  # and real-AIRS (stage C) builders.  Every SFC_VARS channel NOT listed here
+  # is copied clean from the MERRA-2 reanalysis step instead.
+  #
+  # USER DECISION 2026-08-18 (Zach): winds come out.  The 10-m winds are a
+  # reanalysis field either way -- the fullgrid u/v are the advecting model
+  # winds, not an AIRS retrieval -- so kriging them only injected gap-fill
+  # error (~+1.4/+2.1 m/s mean shifts, roughly halved variance vs the frozen
+  # 10-m stats) into a channel we can simply read from MERRA-2, exactly as
+  # SLP already is.  Supersedes the 2026-08-15 decision to mask+krige winds
+  # in stage B for stage-A/B/C channel-treatment symmetry: that symmetry is
+  # now achieved the other way round, with U10M/V10M/SLP clean in EVERY
+  # stage and only the genuinely AIRS-retrieved thermodynamics kriged.
+  # REPORTING CONSEQUENCE: the "AIRS leg" now sees reanalysis SLP *and*
+  # reanalysis winds; only T2M/QV2M carry satellite information, so the
+  # thermo-only ablation is what isolates the AIRS contribution.
+  kriged_channels: [T2M, QV2M]
   # Cells covered in at least this fraction of a cycle-day's composited
   # overpasses count as inside the expected 16-day-repeat swath (Zach asked
   # for the 5-10% band, 2026-08-13); below it a cell is out-of-swath and a

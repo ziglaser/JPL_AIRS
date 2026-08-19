@@ -45,7 +45,8 @@ def test_airs_and_kriging_tunables():
     assert vals["AIRS_SURFACE_LAPSE_K_PER_KM"] == 6.5
     assert vals["AIRS_SURFACE_LAPSE_DERIVED"] is True
     assert vals["AIRS_SURFACE_LAPSE_CLIP_K_PER_KM"] == (-3.0, 9.8)
-    assert vals["KRIGED_CHANNELS"] == ("T2M", "QV2M", "U10M", "V10M")
+    # user decision 2026-08-18: winds are clean reanalysis, like SLP
+    assert vals["KRIGED_CHANNELS"] == ("T2M", "QV2M")
     assert vals["KRIGE_VARIOGRAM"] == "linear"
     assert vals["KRIGE_MAX_OBS"] == 1500
     assert vals["KRIGE_SEED"] == 20260812
@@ -57,7 +58,9 @@ def test_module_constants_come_from_yaml():
         value = getattr(config, const)
         assert not isinstance(value, list), f"{const} should be a tuple"
         assert isinstance(value, (numbers.Number, tuple, str)), const
-    assert config.MAX_EPOCHS == 600           # spot-check a train.py consumer
+    # spot-check a train.py consumer; 1200 = the paper's figure, restored
+    # 2026-08-18 after the 600 cap proved binding (best epoch 566-596/600)
+    assert config.MAX_EPOCHS == 1200
     assert config.LABEL_WIDTH == 3            # ...and a dataset.py consumer
 
 

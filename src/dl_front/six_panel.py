@@ -36,7 +36,8 @@ import pandas as pd
 from tqdm import tqdm
 
 from . import config, dataset, evaluate_test, predict
-from .quicklook import INK, OUT_OF_DOMAIN_GRAY, _style_axis, _window
+from .quicklook import (INK, OUT_OF_DOMAIN_GRAY, _edge_extent, _style_axis,
+                        _window)
 
 MONTHS = tuple(range(3, 12))          # March .. November inclusive
 YEARS = (2016, 2017, 2018)            # BK19-comparable test years
@@ -116,7 +117,14 @@ def render(when: pd.Timestamp, truth: np.ndarray, bk19_pred: np.ndarray,
     import matplotlib.pyplot as plt
 
     cmap, norm, names = _class_cmap(n_classes)
-    extent = _window(dataset.crop_domain())
+    # The panel arrays are FULL 68x141 label grids, so imshow must be given
+    # the full-grid edge extent (quicklook._edge_extent); handing it the crop
+    # window instead squeezed the whole -171..-31 E / 10..77 N grid into the
+    # crop box, which shifted every front tens of degrees and shrank the
+    # analysis domain to a staircase blob over the east coast.  Zoom with the
+    # axis limits instead.
+    extent = _edge_extent()
+    crop_box = _window(dataset.crop_domain())
     domain_box = _window(dataset.analysis_domain())
 
     panels = [
@@ -137,6 +145,8 @@ def render(when: pd.Timestamp, truth: np.ndarray, bk19_pred: np.ndarray,
                  domain_box[2]],
                 color=INK, lw=0.6, ls="--")
         ax.set_title(title, color=INK, fontsize=9)
+        ax.set_xlim(crop_box[0], crop_box[1])
+        ax.set_ylim(crop_box[2], crop_box[3])
         _style_axis(ax)
 
     handles = [plt.Rectangle((0, 0), 1, 1, color=FRONT_COLORS[n])
@@ -168,13 +178,36 @@ def main(argv=None):
                           "the same draw across reruns)")
     ap.add_argument("--out-dir", default=None,
                      help=f"default {config.RESULTS_DIR}/quicklook/six_panel")
+    ap.add_argument("--channels", default=None,
+                     help="comma-separated input channels BOTH checkpoints "
+                          f"consume, a subset of {','.join(config.SFC_VARS)} "
+                          "(default: adopt run_args.channels from the D6A "
+                          "checkpoint's run_config.yaml, else the yaml "
+                          "inputs.channels).  D6A and D6C are fed the SAME "
+                          "loaded x arrays below, so they must agree on "
+                          "channels; a reduced-channel ladder checkpoint or "
+                          "a same-arity relabelling is refused here with an "
+                          "actionable message instead of a raw Keras shape "
+                          "error further down (review 2026-08-18, "
+                          "consumers)")
     a = ap.parse_args(argv)
 
     out_dir = (Path(a.out_dir) if a.out_dir is not None
               else config.RESULTS_DIR / "quicklook/six_panel")
     models_dir = config.RESULTS_DIR / "models"
-    m_a = predict.load_model(models_dir / f"D6A-f{a.fold}" / f"D6A-f{a.fold}.h5")
-    m_c = predict.load_model(models_dir / f"D6C-f{a.fold}" / f"D6C-f{a.fold}.h5")
+    ckpt_a = models_dir / f"D6A-f{a.fold}" / f"D6A-f{a.fold}.h5"
+    ckpt_c = models_dir / f"D6C-f{a.fold}" / f"D6C-f{a.fold}.h5"
+    # Channels first (evaluate_test.resolve_channels/check_model_channels,
+    # reused rather than reimplemented, review 2026-08-18): install the
+    # resolved channel tuple BEFORE sample_pool loads any x array below, then
+    # verify BOTH checkpoints against it -- a mismatch (either checkpoint)
+    # raises the checkpoint's own actionable fix instead of Keras's raw
+    # "expected shape" error once .predict() is finally called.
+    evaluate_test.resolve_channels(str(ckpt_a), a.channels)
+    m_a = predict.load_model(ckpt_a)
+    m_c = predict.load_model(ckpt_c)
+    evaluate_test.check_model_channels(m_a, ckpt_a)
+    evaluate_test.check_model_channels(m_c, ckpt_c)
 
     stats = dataset.load_norm_stats()
     pool, year_sources = sample_pool(a.classes, stats)

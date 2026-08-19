@@ -48,6 +48,22 @@
 #   WARM_START         optional existing stage-A .h5 to --retrain phase 1 from
 #   KRIGE_WORKERS      default 8 (matches dlfront_krige.sbatch cpus)
 #   FORCE=1            resubmit phases whose done-marker already exists
+#   FORCE_EVAL=1       resubmit ONLY phase 4 (eval legs + compare), leaving
+#                      training and kriging done-markers alone -- this is
+#                      step 1 of "re-score existing checkpoints against
+#                      regenerated labels, no retrain" (user decision
+#                      2026-08-13; label-staleness detection added
+#                      2026-08-18).  Unlike FORCE=1 it does NOT rebuild krige
+#                      caches or retrain; use it after a label regeneration
+#                      when every checkpoint already exists.
+#   FORCE_TRAIN=1      re-run the training phases even when <name>_final.h5
+#                      exists, WITHOUT rebuilding the krige caches, the swath
+#                      bank, or the quicklooks -- THE lever for "retrain on
+#                      regenerated labels without rebuilding krige caches"
+#                      (the caches carry input fields only; labels play no
+#                      part in them).  It does not force evals directly, but
+#                      every eval whose train job ran this invocation reruns
+#                      anyway (see Idempotency below).
 #   DRY_RUN=1          print every sbatch/python command without executing
 #   QUICKLOOK=0        skip the spot-check PNG jobs (default on: after the
 #                      swath bank and each krige phase a dl_front.quicklook
@@ -63,11 +79,29 @@
 # runs (bk19 included) when their CSV exists AND its _run.json proves it is
 # the matched full-span run (years == the 2016-2018 span; reanalysis/bk19
 # legs additionally matched to the kriged-airs time axis -- a stale
-# --no-match or partial-years debugging CSV is rerun, never compared); the
-# compare job when comparison.csv exists AND no eval ran this submission.
-# FORCE=1 overrides
-# all of these (and passes --force to the krige builders so existing year
-# caches are rebuilt).
+# --no-match or partial-years debugging CSV is rerun, never compared) AND
+# its recorded labels_sha1 equals the CURRENT front-label content digest
+# (computed once per invocation via `dl_front.evaluate_test label-digest`;
+# a label bug fix on 2026-08-17 regenerated every year's labels, so every
+# _run.json written before this check existed has no labels_sha1 at all --
+# that counts as stale, and the CSV is rerun).  If the digest cannot be
+# computed (the submitting shell lacks the fronts-tf env -- the same
+# situation cache_is_current already handles for the krige schema probe),
+# the labels_sha1 comparison is skipped for this invocation and a loud warning
+# is printed instead of failing the chain; the years/match_source checks
+# above still apply.  Checkpoint identity is verified the same way: the
+# _run.json's ckpt_sha1 must equal the sha1 of the checkpoint .h5 currently
+# on disk (skipped for the checkpoint-free bk19 leg); a _run.json with NO
+# ckpt_sha1 while the checkpoint file exists is stale, and a missing
+# checkpoint file is non-matching.  Independently of provenance, an eval
+# whose stage's train job was submitted/executed by THIS invocation always
+# reruns -- freshly retrained weights invalidate the old CSV.  The compare
+# job runs when comparison.csv exists AND
+# no eval ran this submission.  FORCE=1 overrides all of these (and passes
+# --force to the krige builders so existing year caches are rebuilt).
+# FORCE_EVAL=1 overrides ONLY the eval/compare skip predicates -- training
+# and krige phases keep their normal skip behaviour -- for the "re-score
+# existing checkpoints, do not retrain" workflow.
 #
 # No SLURM?  The script detects the absence of `sbatch` and runs the exact
 # same steps sequentially in the foreground (see the runbook for
@@ -110,6 +144,8 @@ FOLDS=${FOLDS:-0 1 2}
 WARM_START=${WARM_START:-}
 KRIGE_WORKERS=${KRIGE_WORKERS:-8}
 FORCE=${FORCE:-0}
+FORCE_EVAL=${FORCE_EVAL:-0}
+FORCE_TRAIN=${FORCE_TRAIN:-0}
 DRY_RUN=${DRY_RUN:-0}
 QUICKLOOK=${QUICKLOOK:-1}
 # phase-4 test years (user decision 2026-08-13): the BK19 published
@@ -129,7 +165,8 @@ MANIFEST=$JPL_AIRS_RESULTS/dl_front/chain_$(date +%Y%m%d_%H%M%S).txt
     echo "# dl_front JPL chain manifest  $(date -Is)"
     echo "# repo=$JPL_AIRS_REPO data=$JPL_AIRS_DATA fcst=$JPL_AIRS_FCST"
     echo "# results=$JPL_AIRS_RESULTS classes=$CLASSES folds='$FOLDS'"
-    echo "# warm_start='${WARM_START}' force=$FORCE dry_run=$DRY_RUN"
+    echo "# warm_start='${WARM_START}' force=$FORCE force_eval=$FORCE_EVAL" \
+         "force_train=$FORCE_TRAIN dry_run=$DRY_RUN"
 } > "$MANIFEST"
 
 HAVE_SLURM=0
@@ -141,21 +178,34 @@ record() { echo "$1=$2" >> "$MANIFEST"; }
 # ---- skip predicates (FORCE=1 defeats all) -------------------------------- #
 skip_train() {  # skip_train <name>
     [ "$FORCE" = 1 ] && return 1
+    [ "$FORCE_TRAIN" = 1 ] && return 1
     [ -e "$MODELS/$1/$1_final.h5" ]
 }
-# cache_is_v3 <cache.nc>: 0 iff the cache carries schema_version=3.
-# Submit-time schema probe (review 2026-08-13): a cluster whose kriged cache
-# dirs predate the 2026-08-13 domain decision holds v1/v2 caches that pass
-# the existence check --
-# 2a/3a would be skipped and the 2b/3b GPU jobs would die at data-load
-# time in the loader's schema guard, wasting the allocation.  When the
-# submitting shell has no netCDF reader (SLURM branch may run outside
-# fronts-tf), fall back to existence-only: the loader still guards at run
-# time.
-cache_is_v3() {
-    python3 - "$1" <<'PY' 2>/dev/null
+# KRIGE_SCHEMA_READABLE: the ONE place the readable kriged-cache schema
+# numbers live -- the versions the LOADER will read, not the one the builder
+# stamps (krige_fill.py writes schema_version=4).  v3 and v4 share an
+# identical on-disk layout; v4 only marks U10M/V10M as clean reanalysis
+# instead of kriged fills, a per-CHANNEL provenance difference that
+# dl_front.dataset gates per channel against INPUT_CHANNELS.  So a v3 cache
+# is fully valid for a T2M/QV2M(/SLP) model and is refused only for a run
+# that actually consumes the winds; testing == 4 here would force a
+# multi-hour rebuild for runs that never read a wind channel.  v1 (full-grid
+# fills, no gap_type) and v2 (old region-mask domain) are genuine format
+# breaks and stay excluded.
+KRIGE_SCHEMA_READABLE="3 4"
+# cache_is_current <cache.nc>: 0 iff the cache carries a schema_version in
+# $KRIGE_SCHEMA_READABLE.  Submit-time probe: a cluster whose kriged cache
+# dirs predate the 2026-08-13 domain decision holds stale caches that pass
+# the existence check -- 2a/3a would be skipped and the 2b/3b GPU jobs would
+# die at data-load time in the loader's schema guard, wasting the
+# allocation.  When the submitting shell has no netCDF reader (SLURM branch
+# may run outside fronts-tf), fall back to existence-only: the loader still
+# guards at run time.
+cache_is_current() {
+    python3 - "$1" $KRIGE_SCHEMA_READABLE <<'PY' 2>/dev/null
 import sys
 path = sys.argv[1]
+readable = {int(v) for v in sys.argv[2:]}
 def version():
     try:
         from netCDF4 import Dataset
@@ -170,11 +220,11 @@ try:
 except ImportError:
     sys.exit(0)                 # no reader available: existence-only
 except Exception:
-    sys.exit(1)                 # unreadable cache: not a valid v3 file
-sys.exit(0 if v == 3 else 1)
+    sys.exit(1)                 # unreadable cache: not a valid current file
+sys.exit(0 if v in readable else 1)
 PY
 }
-skip_krige() {  # skip_krige <cache-dir> <first-year> <last-year>
+skip_krige() {  # skip_krige <cache-dir> <first-year> <last-year> <build-subcommand>
     # every year must exist: the builder writes even zero-step years, so a
     # missing file means unfinished work, not an empty year
     [ "$FORCE" = 1 ] && return 1
@@ -182,13 +232,18 @@ skip_krige() {  # skip_krige <cache-dir> <first-year> <last-year>
     for ((y = $2; y <= $3; y++)); do
         f=$1/kriged_sfc_$y.nc
         [ -e "$f" ] || return 1
-        if ! cache_is_v3 "$f"; then
+        if ! cache_is_current "$f"; then
             # resubmitting without FORCE cannot fix this: the builder
-            # skips existing year files, so the stale cache would survive
-            note "ERROR: $f is not a schema-v3 cache (pre-domain v1/v2 or" \
-                 "unreadable).  Delete THAT FILE and rerun (rebuilds just" \
-                 "that year).  FORCE=1 also works but is GLOBAL: it re-runs" \
-                 "every completed training and rebuilds every year cache."
+            # skips existing year files, so a stale cache would survive
+            # forever -- it must be REBUILT (per year), not deleted
+            note "ERROR: $f is not a readable-schema cache (need one of $KRIGE_SCHEMA_READABLE)" \
+                 "(stale v1/v2, or unreadable).  REBUILD it (the builder" \
+                 "skips existing year files, so resubmitting alone will not" \
+                 "fix this) with:" \
+                 "PYTHONPATH=src python -m dl_front.krige_fill $4" \
+                 "--years $2-$3 --force" \
+                 "-- or set FORCE=1 on this chain, which also rebuilds" \
+                 "every year cache AND re-runs every completed training."
             exit 3
         fi
     done
@@ -207,17 +262,47 @@ skip_quicklook() {  # skip_quicklook <build-jid-or-empty> <png-dir>
     [ -z "$1" ] || return 1                       # build ran -> re-render
     compgen -G "$2/*.png" > /dev/null
 }
+# Current front-label content digest (label_digest, C5/2026-08-18): computed
+# ONCE per invocation (not once per leg -- there are ~19 of them) and cached
+# here, then compared below against each eval leg's recorded labels_sha1 so
+# a metrics CSV computed on the pre-2026-08-17 label-fix labels is caught as
+# stale even though its years/match_source provenance still looks fine.
+# `dl_front.evaluate_test label-digest` needs the fronts-tf env (it loads the
+# label netCDFs); the submitting shell may lack it, exactly the situation
+# cache_is_current already handles for the krige schema probe above --
+# degrade
+# gracefully (empty digest -> labels_sha1 check skipped in eval_run_matches)
+# rather than let a failing command substitution kill the whole chain under
+# `set -euo pipefail`.
+LABELS_SHA1=""
+if LABELS_SHA1=$(PYTHONPATH=src python -m dl_front.evaluate_test \
+                      label-digest --classes "$CLASSES" --years "$EVAL_YEARS" \
+                      2>logs/label_digest_probe.log); then
+    note "current label digest: $LABELS_SHA1 (classes=$CLASSES years=$EVAL_YEARS)"
+else
+    LABELS_SHA1=""
+    note "WARNING: could not compute the current label digest (submitting" \
+         "shell likely lacks the fronts-tf env -- see" \
+         "logs/label_digest_probe.log).  Label-staleness detection is" \
+         "DISABLED for this invocation: an eval CSV computed on labels from" \
+         "before the 2026-08-17 fix could be silently reused.  Re-run from" \
+         "a shell with 'conda activate fronts-tf' to re-enable it."
+fi
+
 # An eval CSV's filename encodes only ckpt+source, so its existence alone
 # cannot prove it is the run the three-way comparison needs: a manual
 # debugging run (--no-match, partial --years) writes the SAME stem.  Trust
-# only a _run.json provenance recording the full $EVAL_YEARS span and (for
+# only a _run.json provenance recording the full $EVAL_YEARS span, (for
 # reanalysis/bk19 legs, which would otherwise score every step) the
-# kriged-airs time-axis match; kriged-airs legs ARE the cache steps, so no
-# match is recorded for them (evaluate_test sets match_source=null there).
-eval_run_matches() {  # eval_run_matches <run.json> <source>
-    python3 - "$1" "$2" "$EVAL_YEARS" <<'PY'
-import json, sys
-path, source, span = sys.argv[1:4]
+# kriged-airs time-axis match, a ckpt_sha1 equal to the digest of the
+# checkpoint .h5 currently on disk (checkpoint legs only -- bk19 has none),
+# and -- when the current digest was computable -- a labels_sha1 equal to
+# $LABELS_SHA1; kriged-airs legs ARE the cache steps, so no match_source is
+# recorded for them (evaluate_test sets match_source=null there).
+eval_run_matches() {  # eval_run_matches <run.json> <source> <labels_sha1> <ckpt-path-or-empty>
+    python3 - "$1" "$2" "$EVAL_YEARS" "$3" "$4" <<'PY'
+import hashlib, json, os, sys
+path, source, span, labels_sha1, ckpt = sys.argv[1:6]
 try:
     run = json.load(open(path))
 except (OSError, ValueError):
@@ -226,15 +311,47 @@ first, last = span.split("-")
 ok = (run.get("years") == list(range(int(first), int(last) + 1))
       and (source == "kriged-airs"
            or run.get("match_source") == "kriged-airs"))
+# Checkpoint identity (ckpt is empty for the checkpoint-free bk19 leg): the
+# CSV must have been scored by the weights currently on disk -- a retrain
+# overwrites <ckpt>.h5 in place, so filename provenance alone proves
+# nothing.  evaluate_test records ckpt_sha1 = sha1 of the .h5 bytes.  A
+# run.json with NO ckpt_sha1 while the checkpoint file exists predates this
+# check: stale.  A missing checkpoint file cannot be verified (and the eval
+# cannot run): non-matching.
+if ok and ckpt:
+    if not os.path.exists(ckpt):
+        ok = False
+    else:
+        h = hashlib.sha1()
+        with open(ckpt, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        ok = run.get("ckpt_sha1") == h.hexdigest()
+# Empty labels_sha1 means the current digest could not be computed this
+# invocation (no fronts-tf env in the submitting shell) -- degrade
+# gracefully rather than mark every CSV stale just because we can't check
+# (chain owner instructions 2026-08-18, C7).  A run.json with no
+# labels_sha1 at all (every CSV from before this check existed) still
+# fails here whenever the digest WAS computable, which is the point.
+if ok and labels_sha1:
+    ok = run.get("labels_sha1") == labels_sha1
 sys.exit(0 if ok else 1)
 PY
 }
-skip_eval() {   # skip_eval <csv-stem> <source>   (stem <ckpt>_<source>, or 'bk19')
+# skip_eval <csv-stem> <source> <ckpt-path-or-empty> <train-jid-or-empty>
+# (stem <ckpt>_<source>, or 'bk19'; the 4th arg is non-empty when this
+# invocation submitted/ran the training for that checkpoint -- freshly
+# retrained weights always invalidate the old CSV, so the eval must follow)
+skip_eval() {
     [ "$FORCE" = 1 ] && return 1
+    [ "$FORCE_EVAL" = 1 ] && return 1
+    [ -n "${4:-}" ] && return 1
     local dir=$JPL_AIRS_RESULTS/dl_front/test_eval
     [ -e "$dir/$1.csv" ] || return 1
-    eval_run_matches "$dir/${1}_run.json" "$2" && return 0
-    note "phase4 eval $1: existing CSV is not a matched $EVAL_YEARS run" \
+    eval_run_matches "$dir/${1}_run.json" "$2" "$LABELS_SHA1" "$3" && return 0
+    note "phase4 eval $1: existing CSV is not a matched $EVAL_YEARS run," \
+         "was computed on labels that have since changed, or was scored by" \
+         "a checkpoint other than the one now on disk" \
          "(stale/debug ${1}_run.json) -- rerunning"
     return 1
 }
@@ -348,7 +465,7 @@ if [ "$HAVE_SLURM" = 1 ]; then
     fi
 
     J2A=""
-    if skip_krige "$KRIGED_DEGRADED" 2007 2015; then
+    if skip_krige "$KRIGED_DEGRADED" 2007 2015 build-degraded; then
         note "skip phase2a (kriged degraded caches 2007-2015 exist; FORCE=1 to rebuild)"
     else
         submit phase2a-krige-degraded 0 "$JSB" slurm/dlfront_krige.sbatch \
@@ -366,7 +483,7 @@ if [ "$HAVE_SLURM" = 1 ]; then
     fi
 
     J3A=""
-    if skip_krige "$KRIGED_AIRS" 2007 2021; then
+    if skip_krige "$KRIGED_AIRS" 2007 2021 build-airs; then
         note "skip phase3a (kriged AIRS caches 2007-2021 exist; FORCE=1 to rebuild)"
     else
         submit phase3a-krige-airs 0 "$JSB" slurm/dlfront_krige.sbatch \
@@ -418,8 +535,17 @@ if [ "$HAVE_SLURM" = 1 ]; then
         fi
 
         for ckpt in "$A" "$B" "$C"; do
+            # this stage's train job id (empty when training was skipped):
+            # both the eval's dependency and skip_eval's "the weights are
+            # about to change, the eval must follow" signal
+            case "$ckpt" in
+                "$A") train_jid=$J1 ;;
+                "$B") train_jid=$J2B ;;
+                *)    train_jid=$J3B ;;
+            esac
             for src in reanalysis kriged-airs; do
-                if skip_eval "${ckpt}_${src}" "$src"; then
+                if skip_eval "${ckpt}_${src}" "$src" "$MODELS/$ckpt/$ckpt.h5" \
+                             "$train_jid"; then
                     note "skip phase4 eval $ckpt/$src (matched CSV exists; FORCE=1 to rerun)"
                     continue
                 fi
@@ -429,12 +555,7 @@ if [ "$HAVE_SLURM" = 1 ]; then
                 # intersect their time steps with the cache's time axis
                 # (evaluate_test comparability guarantee).  Skipped phases
                 # drop out.
-                case "$ckpt" in
-                    "$A") deps=$J1 ;;
-                    "$B") deps=$J2B ;;
-                    *)    deps=$J3B ;;
-                esac
-                deps=$(join_deps "$deps" "$J3A")
+                deps=$(join_deps "$train_jid" "$J3A")
                 submit "phase4-eval-$ckpt-$src" 0 "$deps" \
                        slurm/dlfront_eval.sbatch \
                        --ckpt "$MODELS/$ckpt/$ckpt.h5" --classes "$CLASSES" \
@@ -444,9 +565,10 @@ if [ "$HAVE_SLURM" = 1 ]; then
         done
     done
 
-    # fold-independent BK19 published-prediction leg (checkpoint-free); needs
-    # 3a only, for the time-axis intersection with the kriged-airs cache
-    if skip_eval bk19 bk19; then
+    # fold-independent BK19 published-prediction leg (checkpoint-free -- no
+    # ckpt_sha1 or train-job condition applies); needs 3a only, for the
+    # time-axis intersection with the kriged-airs cache
+    if skip_eval bk19 bk19 "" ""; then
         note "skip phase4 eval bk19 (matched CSV exists; FORCE=1 to rerun)"
     else
         submit phase4-eval-bk19 0 "$J3A" slurm/dlfront_eval.sbatch \
@@ -495,7 +617,7 @@ else
         fi
     fi
     K2A_RAN=""
-    if skip_krige "$KRIGED_DEGRADED" 2007 2015; then
+    if skip_krige "$KRIGED_DEGRADED" 2007 2015 build-degraded; then
         note "skip phase2a (caches exist)"
     else
         run_local phase2a-krige-degraded dl_front.krige_fill \
@@ -513,7 +635,7 @@ else
         fi
     fi
     K3A_RAN=""
-    if skip_krige "$KRIGED_AIRS" 2007 2021; then
+    if skip_krige "$KRIGED_AIRS" 2007 2021 build-airs; then
         note "skip phase3a (caches exist)"
     else
         run_local phase3a-krige-airs dl_front.krige_fill \
@@ -534,12 +656,17 @@ else
     NEW_EVALS=0   # evals run this pass (compare-job trigger)
     for k in $FOLDS; do
         A=D6A-f$k B=D6B-f$k C=D6C-f$k
+        # non-empty when this pass actually trained the stage: skip_eval's
+        # "the weights just changed, the eval must follow" signal (same
+        # contract as the SLURM branch's train job ids)
+        A_RAN="" B_RAN="" C_RAN=""
         if skip_train "$A"; then
             note "skip phase1 $A (final exists)"
         else
             args=(--name "$A" --classes "$CLASSES" --fold "$k" --source reanalysis)
             [ -n "$WARM_START" ] && args+=(--retrain "$WARM_START")
             run_local "phase1-$A" dl_front.train "${args[@]}"
+            A_RAN=1
         fi
         if skip_train "$B"; then
             note "skip phase2b $B (final exists)"
@@ -547,6 +674,7 @@ else
             run_local "phase2b-$B" dl_front.train --name "$B" \
                 --classes "$CLASSES" --fold "$k" --source kriged-degraded \
                 --retrain "$MODELS/$A/$A.h5"
+            B_RAN=1
         fi
         if skip_train "$C"; then
             note "skip phase3b $C (final exists)"
@@ -554,10 +682,17 @@ else
             run_local "phase3b-$C" dl_front.train --name "$C" \
                 --classes "$CLASSES" --fold "$k" --source kriged-airs \
                 --retrain "$MODELS/$B/$B.h5"
+            C_RAN=1
         fi
         for ckpt in "$A" "$B" "$C"; do
+            case "$ckpt" in
+                "$A") train_ran=$A_RAN ;;
+                "$B") train_ran=$B_RAN ;;
+                *)    train_ran=$C_RAN ;;
+            esac
             for src in reanalysis kriged-airs; do
-                if skip_eval "${ckpt}_${src}" "$src"; then
+                if skip_eval "${ckpt}_${src}" "$src" "$MODELS/$ckpt/$ckpt.h5" \
+                             "$train_ran"; then
                     note "skip phase4 eval $ckpt/$src (matched CSV exists)"
                 else
                     run_local "phase4-eval-$ckpt-$src" dl_front.evaluate_test \
@@ -570,7 +705,7 @@ else
     done
 
     # fold-independent BK19 published-prediction leg (checkpoint-free)
-    if skip_eval bk19 bk19; then
+    if skip_eval bk19 bk19 "" ""; then
         note "skip phase4 eval bk19 (matched CSV exists)"
     else
         run_local phase4-eval-bk19 dl_front.evaluate_test \

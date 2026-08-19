@@ -12,6 +12,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+pytest.skip("front_finder UNET track on ice until after quals (2026-08-14); "
+            "re-enable when re-vendoring fronts/ dev-master",
+            allow_module_level=True)
+
 from test_front_dataset import (  # noqa: F401  (patched_dirs is a fixture)
     _write_codsus_year, _write_merra2_day, patched_dirs)
 

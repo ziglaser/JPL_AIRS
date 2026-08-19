@@ -9,6 +9,15 @@ import xarray as xr
 from dl_front import config, dataset
 from dl_front.acquire_merra2_sfc import PHYSICAL_BOUNDS, bicubic_to_label_grid, is_physical
 
+#: ``dataset.analysis_domain()``/``crop_domain()``/``region_mask()``
+#: interpolate the land-fraction mask off disk, so even synthetic tests that
+#: reach them need the data root's mask file.  Skipped, never failed, on
+#: checkouts without a populated data root.
+needs_land_mask = pytest.mark.skipif(
+    not config.LAND_MASK_PATH.exists(),
+    reason=f"land mask {config.LAND_MASK_PATH} not on disk "
+           f"(set JPL_AIRS_DATA to a populated data root)")
+
 
 # --------------------------------------------------------------------------- #
 # Bicubic remap
@@ -108,6 +117,7 @@ def test_class_grid_dryline():
     assert (cls == names.index("none")).sum() == 68 * 141 - 2
 
 
+@needs_land_mask
 def test_valid_label_steps_drops_fill_padding():
     """NOAA year files pad missing analyses as all-LABEL_FILL steps; those
     must be excluded from training/scoring (fill != "no front")."""
@@ -127,6 +137,7 @@ def test_valid_label_steps_drops_fill_padding():
                                   [True, False, True])   # 5-class branch
 
 
+@needs_land_mask
 def test_valid_label_steps_6class_guards_full_crop_domain():
     """Review 2026-08-13: 274 crop_domain() pixels (the 6-class stage-A
     loss mask) lie outside the region mask; fill confined to that band
@@ -189,6 +200,7 @@ def test_sfc_x_standardizes():
     np.testing.assert_allclose(x, 0.5)
 
 
+@needs_land_mask
 def test_region_mask_shape_binary():
     m = dataset.region_mask()
     assert m.shape == config.GRID_SHAPE
@@ -263,6 +275,7 @@ def test_analysis_domain_land_threshold(tmp_path, monkeypatch):
     assert dom.sum() == (53 - 32 + 1) * (107 - 64 + 1) - 1
 
 
+@needs_land_mask
 def test_crop_domain_is_box_plus_halo_no_land():
     """Box expanded by halo_px() on all sides; NO land/codsus intersection."""
     crop = dataset.crop_domain()
@@ -336,21 +349,37 @@ def _write_kriged_year(dirpath, year, times, value: float):
                     attrs={"source": "degraded_reanalysis",
                            "variogram_model": "linear",
                            "max_obs_points": 1500, "created": "test",
-                           # the loader refuses caches without the v3 stamp
-                           # or with mismatched domain provenance
-                           # (domain decision 2026-08-13)
-                           "schema_version": 3,
+                           # the loader refuses caches without the current
+                           # schema stamp, with mismatched domain provenance
+                           # (domain decision 2026-08-13) or with a different
+                           # channel split (winds decision 2026-08-18)
+                           "schema_version": 4,
                            "domain_lat_range": list(config.ANALYSIS_LAT_RANGE),
                            "domain_lon_range": list(config.ANALYSIS_LON_RANGE),
                            "land_fraction_min": config.LAND_FRACTION_MIN,
                            "halo_px": dataset.halo_px(),
+                           "kriged_channels": [v for v in config.SFC_VARS
+                                               if v in config.KRIGED_CHANNELS],
                            "swath_bank": "per-day-envelope"})
     dirpath.mkdir(parents=True, exist_ok=True)
     ds.to_netcdf(dirpath / f"kriged_sfc_{year}.nc")
 
 
 def test_kriged_year_arrays_inner_join_and_zscore(tmp_path, monkeypatch):
-    """Kriged steps pair with labels by exact timestamp; frozen-stats z-score."""
+    """Kriged steps pair with labels by exact timestamp; frozen-stats z-score.
+
+    Scope note (channel-sourcing decision 2026-08-18): the loader now reads
+    only ``config.KRIGED_CHANNELS`` out of the cache and pulls every other
+    input channel from the MERRA-2 ``sfc_daily`` day file at the same
+    timestamp.  This test is about the INNER JOIN and the Z-SCORE, not about
+    provenance, so ``KRIGED_CHANNELS`` is monkeypatched to all five SFC_VARS
+    for its duration: every channel then comes from the synthetic cache and
+    the whole of x is the single known constant, exactly as before the
+    change.  Without it the test would need real reanalysis files on disk
+    and would be asserting the sourcing split instead -- which is covered
+    separately in test_dlfront_airs_krige.py.
+    """
+    monkeypatch.setattr(config, "KRIGED_CHANNELS", config.SFC_VARS)
     label_times = pd.DatetimeIndex(["2010-01-01 18:00", "2010-01-01 21:00",
                                     "2010-01-02 00:00"])
     lab = _multi_time_label_ds(6, label_times,

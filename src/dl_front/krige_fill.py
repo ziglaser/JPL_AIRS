@@ -5,16 +5,26 @@ z-score with the SAME frozen stats as the reanalysis (dataset.kriged_year_arrays
 
 * ``degraded_reanalysis`` (stage B'): clean MERRA-2 reanalysis steps with
   AIRS-shaped gaps punched into ``config.KRIGED_CHANNELS`` and re-filled by
-  ordinary kriging of the surviving pixels; SLP/U10M/V10M stay clean.  The
-  gap shape for a (date, hour) comes from the real fullgrid file when one
-  exists, else from a season-matched draw of the harvested real-gap bank
+  ordinary kriging of the surviving pixels.  The gap shape for a
+  (date, hour) comes from the real fullgrid file when one exists, else from
+  a season-matched draw of the harvested real-gap bank
   (swath.sample_gap_field, terrain-following since 2026-08-16).
 * ``airs_fcst`` (stage C): real AIRS-FCST surface fields
-  (dl_front.airs_fcst.period_fields), ALL four AIRS-derived channels
-  kriged over the full label grid; SLP -- which AIRS does not retrieve --
-  is copied clean from the reanalysis step at the period timestamp.
+  (dl_front.airs_fcst.period_fields), kriged over the crop domain.
 
-Cache schema v3 (user decision 2026-08-13): ``kriged_sfc_{year}.nc`` under
+Both flavors take the SAME channel split from :func:`channel_split`
+(``config.KRIGED_CHANNELS``): T2M/QV2M kriged, SLP/U10M/V10M copied clean
+from the reanalysis step at the period timestamp.  SLP because AIRS
+retrieves no sea-level pressure; U10M/V10M by the 2026-08-18 user decision
+-- the fullgrid u/v are the advecting model winds rather than a retrieval,
+so they are a reanalysis field either way and kriging them only added
+gap-fill error.  CONSEQUENCE FOR REPORTING: only T2M/QV2M carry satellite
+information in a stage-C cache.
+
+Cache schema v4 (2026-08-18; v3 was the 2026-08-13 crop-domain decision,
+ whose only difference is that its U10M/V10M are KRIGED rather than clean
+ reanalysis -- a difference invisible in the file, hence the version bump and
+ the ``kriged_channels`` attr): ``kriged_sfc_{year}.nc`` under
 the per-flavor ``config.KRIGED_SOURCE_DIRS`` directory (manifest reorg
 2026-08-13: ``front_id/degraded_reanalysis`` and ``front_id/
 kriged_airs_fcst``), with dims (time, lat, lon) on the label grid, data vars:
@@ -30,7 +40,7 @@ kriged_airs_fcst``), with dims (time, lat, lon) on the label grid, data vars:
   (exactly the receptive-field radius) to limit that drift.  Beyond
   box + halo nothing can influence an in-box prediction, so nothing is
   filled.  This applies to the NON-kriged clean channels too (SLP/U10M/
-  V10M in the degraded flavor, SLP in airs): schema v3 defines nothing
+  V10M in BOTH flavors since 2026-08-18): the schema defines nothing
   out-of-crop.  (Schema v2 used the codsus region mask as the fill
   domain; the user judged it 'far too large'.)
 * ``valid_frac`` float32 in [0, 1], the PRE-kriging AIRS availability
@@ -47,9 +57,9 @@ kriged_airs_fcst``), with dims (time, lat, lon) on the label grid, data vars:
   note records every 'bank mask used' step.
 
 Global attrs: source/variogram_model/max_obs_points/created plus
-``schema_version=3``, ``domain_lat_range``/``domain_lon_range``/
-``land_fraction_min``/``halo_px`` (the resolved domain decision), and
-``swath_bank`` ('<bank path>' or 'per-day-envelope').  Steps belong to
+``schema_version=4``, ``domain_lat_range``/``domain_lon_range``/
+``land_fraction_min``/``halo_px`` (the resolved domain decision),
+``kriged_channels`` (the resolved channel split), and ``swath_bank`` ('<bank path>' or 'per-day-envelope').  Steps belong to
 the file of their own calendar year (a 00 UTC step on Jan 1 goes in the
 new year).
 
@@ -154,6 +164,54 @@ def _step_timestamp(date: pd.Timestamp, hour: int) -> pd.Timestamp:
     """Label timestamp of one AIRS period: hour 0 means next-day 00 UTC."""
     days = 1 if hour == 0 else 0
     return date.normalize() + pd.Timedelta(days=days, hours=hour)
+
+
+def channel_split() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(kriged, clean)`` channel names, the single source of truth.
+
+    ``config.KRIGED_CHANNELS`` (yaml ``airs.kriged_channels``) names the
+    channels that carry satellite information and are therefore gap-masked
+    and kriged; every other ``config.SFC_VARS`` channel is copied clean from
+    the MERRA-2 reanalysis step.  As of the 2026-08-18 user decision that is
+    SLP + U10M + V10M clean, T2M + QV2M kriged -- the 10-m winds are a
+    reanalysis field either way (the fullgrid u/v are the advecting model
+    winds, not an AIRS retrieval), so kriging them only added gap-fill error.
+
+    Both builders read the split from here so the two flavors can never
+    disagree about which channel is satellite-derived, and so a
+    ``JPL_DLFRONT_CONFIG`` override moves stage B' and stage C together.
+    """
+    kriged = tuple(v for v in config.SFC_VARS if v in config.KRIGED_CHANNELS)
+    clean = tuple(v for v in config.SFC_VARS if v not in config.KRIGED_CHANNELS)
+    unknown = set(config.KRIGED_CHANNELS) - set(config.SFC_VARS)
+    if unknown:
+        raise ValueError(
+            f"airs.kriged_channels names {sorted(unknown)}, which are not "
+            f"DL-FRONT surface channels (config.SFC_VARS = "
+            f"{list(config.SFC_VARS)}); fix configs/dl_front.yaml")
+    return kriged, clean
+
+
+def airs_kriged_channels() -> tuple[str, ...]:
+    """Kriged channels the AIRS fullgrid can actually supply.
+
+    Guards the stage-C build: a channel listed in ``airs.kriged_channels``
+    that AIRS does not retrieve (no ``airs_fcst.CHANNEL_MAP`` entry) has no
+    observations to krige from, which would silently produce an all-NaN
+    in-crop field -- schema v3 forbids that, so refuse at config-read time
+    with the name rather than mid-build with a shape error.
+    """
+    kriged, _ = channel_split()
+    available = set(airs_fcst.CHANNEL_MAP.values())
+    missing = [v for v in kriged if v not in available]
+    if missing:
+        raise ValueError(
+            f"airs.kriged_channels names {missing}, which the AIRS-FCST "
+            f"fullgrid does not supply (CHANNEL_MAP covers "
+            f"{sorted(available)}); AIRS retrieves no such field, so it "
+            f"cannot be kriged -- drop it from configs/dl_front.yaml to have "
+            f"it copied clean from the reanalysis instead")
+    return kriged
 
 
 def _reanalysis_step(when: pd.Timestamp) -> xr.Dataset | None:
@@ -291,10 +349,11 @@ def _build_degraded_day(args) -> tuple[str, list, list]:
                          f"step skipped")
             continue
         target = crop & ~observed
+        kriged_vars, _clean_vars = channel_split()
         fields = {}
         for var in config.SFC_VARS:
             grid = rea[var].values.astype(np.float64)
-            if var in config.KRIGED_CHANNELS:
+            if var in kriged_vars:
                 grid = np.where(observed, grid, np.nan)
                 grid = krige_fill(grid, rng=_step_rng(date, hour, var),
                                   target=target)
@@ -341,26 +400,36 @@ def _build_airs_day(args) -> tuple[str, list, list]:
                          f"build year, skipped")
             continue
         valid_frac = period["valid_frac"].values.astype(np.float32)
+        kriged_vars = airs_kriged_channels()
+        _kriged, clean_vars = channel_split()
         # EVERY kriged channel needs >= 1 observed pixel INSIDE the crop
         # (schema v3, user decision 2026-08-13): krige_fill returns an
         # all-NaN field untouched, which would violate the
         # no-NaN-inside-crop schema (and silently NaN a training loss).
-        empty = [var for var in airs_fcst.CHANNEL_MAP.values()
+        # Only the KRIGED channels are checked -- a clean channel comes from
+        # the reanalysis and needs no AIRS observations at all (2026-08-18).
+        empty = [var for var in kriged_vars
                  if not np.isfinite(period[var].values[crop]).any()]
         if empty:
             notes.append(f"{hour:02d}Z: zero observed pixels inside crop "
                          f"({','.join(empty)}), step skipped")
             continue
-        rea = _reanalysis_step(when)     # AIRS retrieves no SLP: copy clean
+        # Clean channels come from the reanalysis: SLP because AIRS retrieves
+        # no sea-level pressure, U10M/V10M by the 2026-08-18 user decision
+        # (the fullgrid u/v are the advecting model winds, so kriging them
+        # bought gap-fill error on a field MERRA-2 already provides).
+        rea = _reanalysis_step(when)
         if rea is None:
             raise FileNotFoundError(
                 f"no sfc_daily reanalysis step at {when} (needed for the "
-                f"clean SLP channel); fetch it with "
+                f"clean {'/'.join(clean_vars)} channel"
+                f"{'s' if len(clean_vars) > 1 else ''}); fetch it with "
                 f"'python -m dl_front.acquire_merra2_sfc {when.year}'")
-        # clean SLP is crop-only too: schema v3 defines nothing outside
-        fields = {"SLP": np.where(crop, rea["SLP"].values,
-                                  np.nan).astype(np.float32)}
-        for var in airs_fcst.CHANNEL_MAP.values():
+        # clean channels are crop-only too: schema v3 defines nothing outside
+        fields = {var: np.where(crop, rea[var].values,
+                                np.nan).astype(np.float32)
+                  for var in clean_vars}
+        for var in kriged_vars:
             # drop observations outside the crop (HALO obs are kept: real
             # AIRS data constrains the box edges, user decision 2026-08-13),
             # then fill only inside it (krige_fill intersects target with
@@ -450,12 +519,20 @@ def _write_year_cache(steps: list, source: str, year: int, path: Path,
                     variogram_model=config.KRIGE_VARIOGRAM,
                     max_obs_points=config.KRIGE_MAX_OBS,
                     created=datetime.now(timezone.utc).isoformat(),
-                    schema_version=3,
+                    schema_version=config.KRIGE_SCHEMA_VERSION,
                     # the resolved domain decision (user 2026-08-13), so a
                     # cache is self-describing even after the YAML changes
                     domain_lat_range=list(config.ANALYSIS_LAT_RANGE),
                     domain_lon_range=list(config.ANALYSIS_LON_RANGE),
                     land_fraction_min=config.LAND_FRACTION_MIN,
+                    # WHICH channels carry gap-filled satellite information
+                    # (schema v4, user decision 2026-08-18): the rest are
+                    # clean reanalysis copies.  Recorded because the channel
+                    # split is a tunable and a v3 cache's U10M/V10M are
+                    # KRIGED winds where a v4 cache's are clean reanalysis --
+                    # indistinguishable by inspection, so the loader compares
+                    # this attr instead of trusting the file name.
+                    kriged_channels=list(channel_split()[0]),
                     halo_px=halo_px(),
                     swath_bank=bank_used)
     path.parent.mkdir(parents=True, exist_ok=True)

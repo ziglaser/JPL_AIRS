@@ -23,6 +23,13 @@ needs_demo = pytest.mark.skipif(
     airs_fcst.find_fullgrid(DEMO_DAY, root=DEMO_ROOT) is None,
     reason="demo fullgrid day not on disk")
 
+#: ``dataset.crop_domain()`` interpolates the land-fraction mask off disk, so
+#: even fully synthetic cache tests need the mask file from the data root.
+needs_land_mask = pytest.mark.skipif(
+    not config.LAND_MASK_PATH.exists(),
+    reason=f"land mask {config.LAND_MASK_PATH} not on disk "
+           f"(set JPL_AIRS_DATA to a populated data root)")
+
 
 def _smooth_field(shape=config.GRID_SHAPE) -> np.ndarray:
     """A smooth synthetic 'weather field': large-scale gradient + waves.
@@ -158,8 +165,8 @@ def test_build_airs_demo_day(tmp_path, monkeypatch):
     assert ds.attrs["variogram_model"] == config.KRIGE_VARIOGRAM
     assert ds.attrs["max_obs_points"] == 150
     assert "created" in ds.attrs
-    assert ds.attrs["schema_version"] == 3
-    # the resolved domain decision travels in the cache (schema v3)
+    assert ds.attrs["schema_version"] == 4
+    # the resolved domain decision travels in the cache (schema v4)
     assert list(ds.attrs["domain_lat_range"]) == list(config.ANALYSIS_LAT_RANGE)
     assert list(ds.attrs["domain_lon_range"]) == list(config.ANALYSIS_LON_RANGE)
     assert ds.attrs["land_fraction_min"] == config.LAND_FRACTION_MIN
@@ -169,7 +176,7 @@ def test_build_airs_demo_day(tmp_path, monkeypatch):
     assert list(ds["time"].values) == list(
         pd.to_datetime(["2019-06-05 21:00", "2019-06-06 00:00"]))
     assert tuple(ds.sizes[d] for d in ("time", "lat", "lon")) == (2,) + config.GRID_SHAPE
-    # schema v3: SFC_VARS gap-free INSIDE the crop (box + halo), NaN outside
+    # schema v4: SFC_VARS gap-free INSIDE the crop (box + halo), NaN outside
     crop = dataset.crop_domain()
     for var in config.SFC_VARS:
         assert ds[var].dtype == np.float32
@@ -303,9 +310,9 @@ def test_build_airs_empty_year_writes_empty_cache(tmp_path, monkeypatch):
         assert ds.sizes["time"] == 0
         assert set(config.SFC_VARS) | {"valid_frac", "gap_type"} \
             <= set(ds.data_vars)
-        assert ds["gap_type"].dtype == np.int8      # empty year, v3 schema
+        assert ds["gap_type"].dtype == np.int8      # empty year, v4 schema
         assert ds.attrs["source"] == "airs_fcst"
-        assert ds.attrs["schema_version"] == 3
+        assert ds.attrs["schema_version"] == 4
 
     # rerun resumes: the existing year cache is skipped, not rebuilt
     mtime = written[0].stat().st_mtime_ns
@@ -422,7 +429,7 @@ def test_sfc_gap_bank_sampling_prefers_hour_and_season(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Loader vs schema v3: out-of-crop imputation + in-crop corruption guard
+# Loader vs schema v4: out-of-crop imputation + in-crop corruption guard
 # --------------------------------------------------------------------------- #
 
 def _all_none_label_ds(times) -> xr.Dataset:
@@ -438,20 +445,30 @@ def _all_none_label_ds(times) -> xr.Dataset:
 
 
 def _write_v3_cache(dirpath, year, times, value, domain,
-                    poison_pixel=None, schema_version=3,
-                    domain_attrs=None) -> None:
-    """A schema-v3 cache: constant in-crop fields, NaN out-of-crop.
+                    poison_pixel=None, schema_version=4,
+                    domain_attrs=None, channel_values=None,
+                    drop_kriged_attr=False) -> None:
+    """A current-schema cache: constant in-crop fields, NaN out-of-crop.
 
     ``schema_version=None`` omits the attr entirely -- a v1 cache, for the
     loader's schema-guard regression test.  ``domain_attrs`` overrides the
     recorded domain provenance (default: the live config, i.e. a matching
-    cache) for the loader's domain-mismatch regression test."""
+    cache) for the loader's domain-mismatch regression test.
+    ``channel_values`` overrides ``value`` for named channels, which is how
+    the sourcing tests poison the cache's CLEAN channels with a sentinel the
+    loader must never return (channel-sourcing decision 2026-08-18).
+    ``drop_kriged_attr`` omits ``kriged_channels`` entirely, as the v3
+    builders (written before that attr existed) did."""
     shape = (len(times), *config.GRID_SHAPE)
     grid = np.where(domain, np.float32(value), np.nan).astype(np.float32)
     if poison_pixel is not None:        # simulate a corrupt in-domain NaN
         grid[poison_pixel] = np.nan
     data = {v: (("time", "lat", "lon"), np.broadcast_to(grid, shape).copy())
             for v in config.SFC_VARS}
+    for v, other in (channel_values or {}).items():
+        data[v] = (("time", "lat", "lon"), np.broadcast_to(
+            np.where(domain, np.float32(other), np.nan).astype(np.float32),
+            shape).copy())
     data["valid_frac"] = (("time", "lat", "lon"), np.ones(shape, np.float32))
     data["gap_type"] = (("time", "lat", "lon"), np.broadcast_to(
         np.where(domain, config.GAP_OBSERVED,
@@ -463,8 +480,12 @@ def _write_v3_cache(dirpath, year, times, value, domain,
              "domain_lon_range": list(config.ANALYSIS_LON_RANGE),
              "land_fraction_min": config.LAND_FRACTION_MIN,
              "halo_px": dataset.halo_px(),
+             "kriged_channels": [v for v in config.SFC_VARS
+                                 if v in config.KRIGED_CHANNELS],
              "swath_bank": "per-day-envelope"}
     attrs.update(domain_attrs or {})
+    if drop_kriged_attr:
+        attrs.pop("kriged_channels")
     if schema_version is not None:
         attrs["schema_version"] = schema_version
     ds = xr.Dataset(data, coords={"time": pd.DatetimeIndex(times),
@@ -477,8 +498,17 @@ def _write_v3_cache(dirpath, year, times, value, domain,
 
 def test_loader_imputes_out_of_crop_to_standardized_zero(tmp_path,
                                                          monkeypatch):
-    """Schema v3 NaN outside the crop -> x == 0.0 there after z-scoring
-    (the standardized mean, degrade_sfc's gap-imputation convention)."""
+    """Schema v4 NaN outside the crop -> x == 0.0 there after z-scoring
+    (the standardized mean, degrade_sfc's gap-imputation convention).
+
+    ``KRIGED_CHANNELS`` is widened to all five SFC_VARS for the duration so
+    the whole of x comes from the synthetic cache: since the channel-sourcing
+    decision 2026-08-18 the clean channels are read from the reanalysis day
+    file instead, which would make this an assertion about sourcing (covered
+    by test_loader_v3_cache_reads_clean_channels_from_reanalysis) rather than
+    about the out-of-crop impute this test exists for.
+    """
+    monkeypatch.setattr(config, "KRIGED_CHANNELS", config.SFC_VARS)
     times = pd.DatetimeIndex(["2010-01-01 18:00"])
     monkeypatch.setattr(dataset, "load_label_ds",
                         lambda year, n_classes: _all_none_label_ds(times))
@@ -500,8 +530,9 @@ def test_loader_imputes_out_of_crop_to_standardized_zero(tmp_path,
     np.testing.assert_array_equal(x32[:, ~crop, :], 0.0)
 
 
+@needs_land_mask
 def test_loader_raises_on_in_crop_nan(tmp_path, monkeypatch):
-    """NaN INSIDE the crop violates schema v3 -> loud ValueError."""
+    """NaN INSIDE the crop violates the schema -> loud ValueError."""
     times = pd.DatetimeIndex(["2010-01-01 18:00"])
     monkeypatch.setattr(dataset, "load_label_ds",
                         lambda year, n_classes: _all_none_label_ds(times))
@@ -518,13 +549,19 @@ def test_loader_raises_on_in_crop_nan(tmp_path, monkeypatch):
         dataset.kriged_year_arrays(2010, 6, stats, "kriged-degraded")
 
 
+@needs_land_mask
 def test_loader_rejects_v1_and_v2_caches(tmp_path, monkeypatch):
     """Regression (review 2026-08-13) + domain decision 2026-08-13: a v1
     cache (full-grid fill, no schema_version attr) contains no NaN
     anywhere, so it would sail past the corrupt-cache guard; a v2 cache is
     kriged over the old region-mask domain, which does not cover the new
     box+halo crop.  The loader must refuse both and name the rebuild
-    command."""
+    command.
+
+    Still true after the channel-sourcing relaxation 2026-08-18: that made
+    ``KRIGE_SCHEMA_READABLE == (3, 4)``, because v3 differs from v4 only in
+    per-channel provenance, but v1 and v2 are genuine FORMAT breaks (grid
+    extent) that no amount of per-channel re-sourcing can repair."""
     times = pd.DatetimeIndex(["2010-01-01 18:00"])
     monkeypatch.setattr(dataset, "load_label_ds",
                         lambda year, n_classes: _all_none_label_ds(times))
@@ -549,6 +586,190 @@ def test_loader_rejects_v1_and_v2_caches(tmp_path, monkeypatch):
         dataset.kriged_year_arrays(2010, 6, stats, "kriged-airs")
 
 
+#: A real MERRA-2 ``sfc_daily`` step, needed by the tests that exercise the
+#: clean-channel sourcing path (the loader reads those channels off disk, so
+#: a synthetic cache alone is not enough).  Skipped, never failed, where the
+#: local data root does not carry the day.
+REA_STEP = pd.Timestamp("2016-06-01 18:00")
+needs_rea_day = pytest.mark.skipif(
+    not day_path(REA_STEP).exists(),
+    reason=f"MERRA-2 sfc_daily day file {day_path(REA_STEP)} not on disk")
+
+
+def _rea_stats_and_step() -> tuple[dict, dict]:
+    """Frozen-stats stand-in and the raw fields of :data:`REA_STEP`.
+
+    Stats are derived from the day itself so the standardized reanalysis
+    values land near N(0, 1): x is stored float16, whose ~1e-3 RELATIVE
+    resolution would otherwise make an exact comparison against physical-unit
+    SLP (~1e5 Pa over a unit-scale std) meaningless.
+    """
+    with xr.open_dataset(day_path(REA_STEP)) as day:
+        day = day.load()
+    j = int(np.flatnonzero(pd.DatetimeIndex(day["time"].values) == REA_STEP)[0])
+    raw = {v: day[v].values[j].astype(np.float32) for v in config.SFC_VARS}
+    stats = {v: [float(np.nanmean(raw[v])), float(np.nanstd(raw[v]))]
+             for v in config.SFC_VARS}
+    return stats, raw
+
+
+@needs_rea_day
+def test_loader_reads_v3_cache_at_full_width(tmp_path, monkeypatch):
+    """Channel-sourcing decision 2026-08-18: a v3 cache is READABLE at the
+    full five-channel width, with no rebuild.
+
+    This reverses the previous guard (which refused every v3 cache outright).
+    v3 differs from v4 only in that its U10M/V10M are kriged rather than
+    clean reanalysis copies -- a per-CHANNEL provenance difference, not a
+    format break -- and the loader no longer reads a cache's clean channels
+    at all, so v3's wind copies are simply never touched.  Refusing the file
+    would have forced a multi-hour rebuild of ~15 years of caches for a
+    distinction that cannot reach the model.
+
+    The v3 builders predate the ``kriged_channels`` attr, so the file here
+    carries none: the split has to be recovered from
+    ``config.KRIGE_LEGACY_KRIGED_CHANNELS`` rather than the file being
+    refused for lack of provenance.
+    """
+    times = pd.DatetimeIndex([REA_STEP])
+    monkeypatch.setattr(dataset, "load_label_ds",
+                        lambda year, n_classes: _all_none_label_ds(times))
+    monkeypatch.setattr(
+        config, "KRIGED_SOURCE_DIRS",
+        {"kriged-degraded": tmp_path / "degraded_reanalysis",
+         "kriged-airs": tmp_path / "airs_fcst"})
+    assert config.INPUT_CHANNELS == config.SFC_VARS      # premise: full width
+    assert 3 in config.KRIGE_SCHEMA_READABLE
+    crop = dataset.crop_domain()
+    stats, _ = _rea_stats_and_step()
+    cache_value = {v: stats[v][0] + 2.0 * stats[v][1]    # z-scores to +2
+                   for v in config.KRIGED_CHANNELS}
+    _write_v3_cache(tmp_path / "airs_fcst", 2016, times, value=0.0,
+                    domain=crop, schema_version=3, drop_kriged_attr=True,
+                    channel_values=cache_value)
+
+    x, y, out_times = dataset.kriged_year_arrays(2016, 6, stats, "kriged-airs")
+    assert list(out_times) == list(times) and y.dtype == np.uint8
+    assert x.shape == (1, *config.GRID_SHAPE, 5)
+    x32 = x.astype(np.float32)
+    assert np.isfinite(x32).all()
+    for c in config.KRIGED_CHANNELS:                     # sourced from cache
+        np.testing.assert_allclose(x32[:, crop, config.SFC_VARS.index(c)],
+                                   2.0, rtol=1e-3)
+
+
+@needs_rea_day
+def test_loader_reads_clean_channels_from_the_reanalysis_not_the_cache(
+        tmp_path, monkeypatch):
+    """Channel-sourcing decision 2026-08-18: the CLEAN channels bypass the
+    cache entirely and come from ``sfc_daily`` at the same timestamp.
+
+    A cache's clean channels are by definition a copy of the reanalysis, so
+    there is no reason to trust the copy: reading the source directly means
+    the model sees the SAME SLP/winds at train and eval time no matter which
+    cache generation produced its T2M/QV2M fills, and makes a cache's own
+    clean copies irrelevant (which is what lets a v3 cache be read at all).
+
+    The proof has to be positive, not just "it loaded": the cache's
+    SLP/U10M/V10M are poisoned with an absurd sentinel here, and the returned
+    values must match the z-scored reanalysis field, masked to the crop.
+    """
+    times = pd.DatetimeIndex([REA_STEP])
+    monkeypatch.setattr(dataset, "load_label_ds",
+                        lambda year, n_classes: _all_none_label_ds(times))
+    monkeypatch.setattr(
+        config, "KRIGED_SOURCE_DIRS",
+        {"kriged-degraded": tmp_path / "degraded_reanalysis",
+         "kriged-airs": tmp_path / "airs_fcst"})
+    crop = dataset.crop_domain()
+    stats, raw = _rea_stats_and_step()
+    sentinel = 1.0e6                       # finite (so the NaN guard is quiet)
+    clean = [v for v in config.SFC_VARS if v not in config.KRIGED_CHANNELS]
+    assert clean, "premise: the config keeps at least one channel clean"
+    _write_v3_cache(tmp_path / "airs_fcst", 2016, times, value=12.0,
+                    domain=crop,
+                    channel_values={v: sentinel for v in clean})
+
+    x, _, _ = dataset.kriged_year_arrays(2016, 6, stats, "kriged-airs")
+    x32 = x.astype(np.float32)
+    for c in clean:
+        got = x32[0, ..., config.SFC_VARS.index(c)]
+        want = (raw[c] - stats[c][0]) / stats[c][1]
+        np.testing.assert_allclose(got[crop], want[crop], rtol=1e-2,
+                                   atol=1e-2)
+        assert np.abs(got[crop]).max() < 100.0     # nowhere near the sentinel
+        np.testing.assert_array_equal(got[~crop], 0.0)   # crop-masked impute
+    # the kriged channels still come from the cache: (12 - mean) / std
+    for c in config.KRIGED_CHANNELS:
+        want = (12.0 - stats[c][0]) / stats[c][1]
+        np.testing.assert_allclose(
+            x32[0, crop, config.SFC_VARS.index(c)], want, rtol=1e-2)
+
+
+def test_loader_rejects_cache_holding_a_clean_copy_of_a_kriged_channel(
+        tmp_path, monkeypatch):
+    """The one provenance hazard left after the sourcing decision
+    2026-08-18: a channel the config declares KRIGED that this cache holds as
+    a CLEAN reanalysis copy.
+
+    The cache then carries no satellite information for it, but the values
+    look exactly like a successful fill, so training would quietly use
+    reanalysis where the configuration promises AIRS information.  (The
+    opposite direction -- a cache that kriged MORE than the config asks for
+    -- is deliberately NOT an error any more: those channels are read from
+    the reanalysis and the cache's copies are never touched.  That is the
+    relaxation which made the existing v3/4-channel caches reusable; see
+    test_loader_reads_v3_cache_at_full_width.)"""
+    times = pd.DatetimeIndex(["2010-01-01 18:00"])
+    monkeypatch.setattr(dataset, "load_label_ds",
+                        lambda year, n_classes: _all_none_label_ds(times))
+    monkeypatch.setattr(
+        config, "KRIGED_SOURCE_DIRS",
+        {"kriged-degraded": tmp_path / "degraded_reanalysis",
+         "kriged-airs": tmp_path / "airs_fcst"})
+    # config kriges T2M/QV2M; this cache kriged only QV2M and copied T2M clean
+    _write_v3_cache(
+        tmp_path / "airs_fcst", 2010, times, value=12.0,
+        domain=dataset.crop_domain(),
+        domain_attrs={"kriged_channels": ["QV2M", "U10M", "V10M"]})
+    stats = {v: [10.0, 4.0] for v in config.SFC_VARS}
+    with pytest.raises(ValueError) as exc:
+        dataset.kriged_year_arrays(2010, 6, stats, "kriged-airs")
+    msg = str(exc.value)
+    assert "['T2M'] are kriged channels per config airs.kriged_channels=" in msg
+    assert "holds a CLEAN reanalysis copy where a satellite-shaped gap fill " \
+           "is expected" in msg
+    assert "krige_fill build-airs --years 2010" in msg      # the rebuild fix
+
+
+def test_loader_rejects_legacy_cache_with_no_recoverable_channel_split(
+        tmp_path, monkeypatch):
+    """A readable cache that records no ``kriged_channels`` and has no
+    documented legacy split cannot be sourced at all.
+
+    Since the sourcing decision 2026-08-18 the split IS the contract -- it
+    decides which channels come from the file and which from the reanalysis
+    -- so a file that cannot state it must be refused rather than guessed at.
+    v3 is recoverable (``config.KRIGE_LEGACY_KRIGED_CHANNELS``); a future
+    readable version without the attr would not be, and this pins that the
+    fallback is a lookup, not a default."""
+    times = pd.DatetimeIndex(["2010-01-01 18:00"])
+    monkeypatch.setattr(dataset, "load_label_ds",
+                        lambda year, n_classes: _all_none_label_ds(times))
+    monkeypatch.setattr(
+        config, "KRIGED_SOURCE_DIRS",
+        {"kriged-degraded": tmp_path / "degraded_reanalysis",
+         "kriged-airs": tmp_path / "airs_fcst"})
+    monkeypatch.setattr(config, "KRIGE_LEGACY_KRIGED_CHANNELS", {})
+    _write_v3_cache(tmp_path / "airs_fcst", 2010, times, value=12.0,
+                    domain=dataset.crop_domain(), schema_version=3,
+                    drop_kriged_attr=True)
+    stats = {v: [10.0, 4.0] for v in config.SFC_VARS}
+    with pytest.raises(ValueError,
+                       match=r"no 'kriged_channels' attr.*build-airs"):
+        dataset.kriged_year_arrays(2010, 6, stats, "kriged-airs")
+
+
 def test_loader_rejects_v3_cache_from_different_domain(tmp_path,
                                                        monkeypatch):
     """Review 2026-08-13: a v3 cache built under a DIFFERENT box/halo
@@ -557,7 +778,12 @@ def test_loader_rejects_v3_cache_from_different_domain(tmp_path,
     values where the contract promises the 0-impute; a larger one raised
     a misleading 'cache is corrupt' NaN error.  The recorded domain attrs
     must be compared against the live config; land_fraction_min alone
-    (scoring-mask-only knob) must NOT invalidate a cache."""
+    (scoring-mask-only knob) must NOT invalidate a cache.
+
+    ``KRIGED_CHANNELS`` is widened to all five SFC_VARS so the accepted-cache
+    branch at the end stays a pure statement about the cache's values (see
+    test_loader_imputes_out_of_crop_to_standardized_zero for why)."""
+    monkeypatch.setattr(config, "KRIGED_CHANNELS", config.SFC_VARS)
     times = pd.DatetimeIndex(["2010-01-01 18:00"])
     monkeypatch.setattr(dataset, "load_label_ds",
                         lambda year, n_classes: _all_none_label_ds(times))

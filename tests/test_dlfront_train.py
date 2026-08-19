@@ -12,7 +12,17 @@ import pytest
 
 from dl_front import config, dataset, train
 
+#: ``dataset.analysis_domain()``/``crop_domain()``/``region_mask()``
+#: interpolate the land-fraction mask off disk, so even synthetic tests that
+#: reach them need the data root's mask file.  Skipped, never failed, on
+#: checkouts without a populated data root.
+needs_land_mask = pytest.mark.skipif(
+    not config.LAND_MASK_PATH.exists(),
+    reason=f"land mask {config.LAND_MASK_PATH} not on disk "
+           f"(set JPL_AIRS_DATA to a populated data root)")
 
+
+@needs_land_mask
 def test_loss_mask_routing_6class():
     """Stage A trains on box+halo (crop); every gap-degraded stage on the
     analysis domain only (user decision 2026-08-13)."""
@@ -31,6 +41,7 @@ def test_loss_mask_routing_6class():
     assert name == "analysis_domain"
 
 
+@needs_land_mask
 def test_loss_mask_routing_5class_unchanged():
     """The 5-class paper replication keeps the Fig. 2 region mask for every
     source -- the domain decision applies to the 6-class track only."""

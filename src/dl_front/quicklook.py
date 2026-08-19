@@ -12,8 +12,28 @@ subcommand right after the corresponding build phase:
   (config.SWATH_MIN_FRACTION) drawn as a contour -- the "16-day cycle swath
   maps".
 * ``kriged-degraded`` / ``kriged-airs`` -> one PNG per sampled cache step:
-  all five kriged surface channels plus the gap_type decomposition, framed
-  to the crop window with the analysis domain outlined.
+  all five of the CACHE's OWN surface channels (``config.SFC_VARS``) plus the
+  gap_type decomposition, framed to the crop window with the analysis domain
+  outlined.  This is a spot check of what ``krige_fill`` wrote, on purpose --
+  it deliberately shows the cache's contents whether or not the model reads
+  them (see the channel-provenance note below).
+
+Channel provenance (note added 2026-08-18, consumers review): since the
+config/split-sourcing change, ``dl_front.dataset.kriged_year_arrays`` does
+NOT feed the model every panel below.  A channel in
+``config.KRIGED_CHANNELS`` (yaml ``airs.kriged_channels``; default T2M/QV2M)
+is read FROM THIS CACHE and IS one of the model's actual inputs; every OTHER
+``SFC_VARS`` channel here (on a v3 cache: SLP/U10M/V10M) is copied through
+clean at build time for a DIFFERENT reason (krige_fill's own record of what
+it degraded) but the model instead reads that field fresh from the MERRA-2
+``sfc_daily`` reanalysis at load time and never sees this cache's copy --
+so on a v3 cache those panels show kriged winds/SLP the model never reads.
+``render_step`` labels each panel accordingly (MODEL INPUT vs CACHE ONLY);
+read the label, not just the channel name, before trusting a panel as "what
+the network saw".  The chain script (``scripts/dlfront_jpl_chain.sh``) skips
+regenerating a quicklook step whose PNG already exists, so a PNG rendered
+before this labelling change -- or before a KRIGED_CHANNELS edit -- persists
+with a stale label/split; force a rerun if in doubt.
 
 Sampling is deterministic (evenly spaced over the caches' pooled time axis,
 no RNG), so reruns overwrite the same filenames and two builds of the same
@@ -195,6 +215,17 @@ def render_step(path: Path, t: int, source: str, out_dir: Path) -> Path:
     crop window; the field panels also contour the observed footprint
     (gap_type == GAP_OBSERVED) so the eye can compare real vs kriged
     texture directly.
+
+    This is a spot check of the CACHE's own contents (what ``krige_fill``
+    wrote), not of the model's inputs -- since the split-sourcing change
+    (user decision 2026-08-18) the model reads ``config.KRIGED_CHANNELS``
+    from this cache but every OTHER ``SFC_VARS`` channel fresh from the
+    MERRA-2 reanalysis instead, so a channel title alone would misrepresent
+    a non-kriged panel as the model's input.  Each field panel's title is
+    therefore suffixed ``(model input)`` or ``(cache only -- model reads
+    reanalysis)`` so a reader can tell which is which at a glance (review
+    2026-08-18); what gets PLOTTED is unchanged -- still the cache's own
+    field, on purpose, because that is what this spot check is for.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -234,7 +265,14 @@ def render_step(path: Path, t: int, source: str, out_dir: Path) -> Path:
         cb = fig.colorbar(im, ax=ax, shrink=0.85)
         cb.set_label(f"{var} [{CHANNEL_UNITS[var]}]", color=INK, fontsize=8)
         cb.ax.tick_params(colors=INK, labelsize=7)
-        ax.set_title(var, color=INK, fontsize=10)
+        # Provenance suffix (review 2026-08-18): under the split-sourcing
+        # loader only config.KRIGED_CHANNELS actually reaches the model FROM
+        # this cache; every other SFC_VARS channel is overridden from the
+        # MERRA-2 reanalysis at load time, so this panel is cache-only and
+        # would mislead a reader looking for "what the model saw".
+        provenance = ("model input" if var in config.KRIGED_CHANNELS
+                     else "cache only -- model reads reanalysis")
+        ax.set_title(f"{var}  ({provenance})", color=INK, fontsize=9)
 
     gax = axes.ravel()[5]
     bounds = (config.GAP_OUT_OF_DOMAIN - 0.5, config.GAP_OBSERVED - 0.5,

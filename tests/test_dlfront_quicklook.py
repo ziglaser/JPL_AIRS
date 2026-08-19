@@ -17,6 +17,15 @@ pytest.importorskip("matplotlib")
 
 from dl_front import config, quicklook, swath  # noqa: E402
 
+#: ``dataset.analysis_domain()``/``crop_domain()``/``region_mask()``
+#: interpolate the land-fraction mask off disk, so even synthetic tests that
+#: reach them need the data root's mask file.  Skipped, never failed, on
+#: checkouts without a populated data root.
+needs_land_mask = pytest.mark.skipif(
+    not config.LAND_MASK_PATH.exists(),
+    reason=f"land mask {config.LAND_MASK_PATH} not on disk "
+           f"(set JPL_AIRS_DATA to a populated data root)")
+
 SHAPE = config.GRID_SHAPE                       # (68, 141)
 
 
@@ -119,6 +128,7 @@ def test_sample_steps_year_filter_and_empty_year(tmp_path):
         quicklook.sample_steps("kriged-airs", years=[2011], cache_dir=d)
 
 
+@needs_land_mask
 def test_render_cache_writes_named_pngs(tmp_path):
     d = tmp_path / "caches"
     _write_cache(d, 2010, _hours(2010, [1, 2, 3]))
@@ -141,6 +151,7 @@ def test_cli_swath_bank(tmp_path):
     assert (tmp_path / "ql/swath_bank_18Z.png").exists()
 
 
+@needs_land_mask
 def test_cli_kriged_cache_with_years(tmp_path):
     d = tmp_path / "caches"
     _write_cache(d, 2010, _hours(2010, [1, 2]))
