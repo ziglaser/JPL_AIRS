@@ -14,6 +14,8 @@ by surface moistening -- so trajectories are treated as geometry only.
 
 from __future__ import annotations
 
+import re
+import warnings
 from pathlib import Path
 from typing import Iterable
 
@@ -61,16 +63,55 @@ def _assert_units(ds: xr.Dataset, source: str) -> None:
             )
 
 
+#: Granule files are named ``<anything>_<granule>.nc``; the trailing integer
+#: is the AIRS granule number (1-240, indexing Aqua's 6-min data chunks).
+_GRANULE_FILE_RE = re.compile(r"_(\d+)\.nc$")
+
+
+def discover_granules(day_dir: Path) -> list[tuple[int, Path]]:
+    """Find the ``nogrid_*.nc`` granule files in one day's archive directory.
+
+    The cluster archive holds one directory per day, each containing the same
+    granule file format as the demo day but with day-specific granule numbers
+    and dates, so the granule id must be parsed from the filename rather than
+    taken from ``config.SWATHS``.
+
+    Returns ``(granule, path)`` pairs sorted by granule id (i.e. by Aqua
+    along-track acquisition order, which is also release-time order).
+    """
+    pairs = []
+    for path in Path(day_dir).glob("nogrid_*.nc"):
+        match = _GRANULE_FILE_RE.search(path.name)
+        if match:
+            pairs.append((int(match.group(1)), path))
+    if not pairs:
+        contents = sorted(p.name for p in Path(day_dir).iterdir())
+        raise FileNotFoundError(
+            f"no nogrid_*<granule>.nc files in {day_dir}; directory contains: "
+            f"{contents}"
+        )
+    return sorted(pairs)
+
+
 def load_granule(granule: int, traj_dir: Path = config.TRAJ_DIR) -> xr.Dataset:
-    """Load one granule file as a tidy ``(parcel, step)`` dataset.
+    """Load one demo-day granule as a tidy ``(parcel, step)`` dataset.
 
     A parcel is kept if it is valid (finite ``lat``) at step 0. The five
     per-timestep fields become ``(parcel, step)`` data variables; per-parcel
     metadata (``granule``, ``swath``, ``level``, ``fieldx``, ``fieldy``, release
     position/pressure) and the actual ``time_utc(parcel, step)`` clock become
     coordinates.
+
+    The granule id is resolved to a file via ``config.NOGRID_TEMPLATE`` and to
+    a swath label via the demo-day ``config.SWATHS`` table; for arbitrary
+    archive days use :func:`load_day_dir`, which needs neither.
     """
     path = traj_dir / config.NOGRID_TEMPLATE.format(granule=granule)
+    return _load_granule_file(path, granule, _swath_of(granule))
+
+
+def _load_granule_file(path: Path, granule: int, swath: str) -> xr.Dataset:
+    """Load one granule file given its resolved path and swath label."""
     raw = xr.open_dataset(path)
 
     # time_utc: the raw datetime axis, one value per step, shared by all parcels
@@ -95,7 +136,7 @@ def load_granule(granule: int, traj_dir: Path = config.TRAJ_DIR) -> xr.Dataset:
         step=("step", np.arange(n_step, dtype="int8")),
         parcel=("parcel", np.arange(n_parcel, dtype="int64")),
         granule=("parcel", np.full(n_parcel, granule, dtype="int16")),
-        swath=("parcel", np.full(n_parcel, _swath_of(granule), dtype=object)),
+        swath=("parcel", np.full(n_parcel, swath, dtype=object)),
         level=("parcel", levels),
         fieldx=("parcel", fieldx),
         fieldy=("parcel", fieldy),
@@ -120,6 +161,60 @@ def load_day(
     receptor band top) as a convenience for downstream selection.
     """
     parts = [load_granule(g, traj_dir) for g in granules]
+    return _concat_granules(parts)
+
+
+def load_day_dir(day_dir: Path) -> xr.Dataset:
+    """Load one archive day directory into one ``(parcel, step)`` dataset.
+
+    Like :func:`load_day`, but discovers granule files by globbing rather than
+    the demo-day ``config.SWATHS``/``config.NOGRID_TEMPLATE`` tables, so it
+    works on any day of the cluster archive. Swath labels are assigned from
+    release times: a granule releasing within 1.0 h of the day's earliest
+    release is "early", any later one "late". The Aqua overpass pair is ~1.7 h
+    apart on the demo day, so 1.0 h separates the pair cleanly; the label only
+    feeds the ``n_early``/``n_late`` provenance counts, nothing physical.
+
+    A granule file whose every parcel is invalid at release (all-NaN ``lat`` at
+    step 0 -- e.g. an entirely-over-ocean or cloud-voided granule) contributes
+    zero parcels and is skipped with a warning; indexing its (empty) release
+    clock would otherwise crash the swath labelling. If NO granule survives,
+    that is a data problem the caller must see, not an empty dataset.
+    """
+    parts = []
+    skipped: list[str] = []
+    for g, path in discover_granules(day_dir):
+        part = _load_granule_file(path, g, "early")
+        if part.sizes["parcel"] == 0:
+            skipped.append(path.name)
+            continue
+        parts.append(part)
+    if skipped:
+        warnings.warn(
+            f"{day_dir}: skipped {len(skipped)} granule file(s) with zero "
+            f"valid parcels at release: {', '.join(skipped)}"
+        )
+    if not parts:
+        raise ValueError(
+            f"no granule in {day_dir} contains any valid parcel at release"
+        )
+    releases = np.array([part["time_utc"].values[0, 0] for part in parts])
+    late = (releases - releases.min()) > np.timedelta64(3600, "s")
+    parts = [
+        part if not is_late else part.assign_coords(
+            swath=("parcel", np.full(part.sizes["parcel"], "late", dtype=object))
+        )
+        for part, is_late in zip(parts, late)
+    ]
+    return _concat_granules(parts)
+
+
+def _concat_granules(parts: list[xr.Dataset]) -> xr.Dataset:
+    """Concatenate per-granule datasets: contiguous parcel ids + surface flag.
+
+    Shared tail of :func:`load_day` and :func:`load_day_dir`, factored out so
+    the two entry points cannot drift.
+    """
     day = xr.concat(parts, dim="parcel")
     day = day.assign_coords(parcel=("parcel", np.arange(day.sizes["parcel"], dtype="int64")))
 

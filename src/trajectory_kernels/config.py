@@ -21,15 +21,33 @@ Literature keys used below:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
 # Paths
 # --------------------------------------------------------------------------- #
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
-DATA_DIR: Path = REPO_ROOT / "data"
-RESULTS_DIR: Path = REPO_ROOT / "results"
-LSM_PATH: Path = DATA_DIR / "lsm.nc"  # global 1deg fractional land-sea mask
+#: Data root: the JPL_AIRS_DATA env var when set (dev: /mnt/d/JPL_AIRS/data,
+#: cluster: the AIRS_SMAP_Front_data root), else the repo-local data/ tree --
+#: the same convention as convection_skill.config and the slurm scripts.
+DATA_DIR: Path = Path(os.environ.get("JPL_AIRS_DATA", REPO_ROOT / "data"))
+RESULTS_DIR: Path = Path(os.environ.get("JPL_AIRS_RESULTS", REPO_ROOT / "results"))
+#: Global 1-deg fractional land-sea mask (variable ``lsm``). The historical
+#: location was <data root>/lsm.nc; current data trees carry it at
+#: masks/land_surface_mask.nc -- prefer whichever exists (checked in order).
+_LSM_CANDIDATES = (DATA_DIR / "lsm.nc", DATA_DIR / "masks" / "land_surface_mask.nc")
+LSM_PATH: Path = next((p for p in _LSM_CANDIDATES if p.exists()), _LSM_CANDIDATES[0])
+
+#: Derived inputs for the upwind feature pipeline (scripts/build_upwind_features.py).
+#: Each is overridable by CLI; these are the canonical locations under DATA_DIR.
+SMAP_BASELINE_PATH: Path = (
+    DATA_DIR / "soil_moisture" / "SMAP_L4_smsfc_monthly_baseline_2016-2021.nc")
+PBLH_3HRLY_PATH: Path = (
+    DATA_DIR / "PBL_depth" / "derived" / "PBLH_1deg_3hrly_2017-2021.nc")
+PBLH_CLIM_PATH: Path = (
+    DATA_DIR / "PBL_depth" / "derived" / "PBL_climatology_1deg_conus_utc_2017-2021.nc")
+FCST_TABLE_DIR: Path = DATA_DIR / "FCST_SMAP_MRMS"
 
 #: The HYSPLIT trajectory day used for method development.
 TRAJ_DIR: Path = DATA_DIR / "wrf27km_20190605" / "wrf27km_20190605"
@@ -105,6 +123,11 @@ PBL_SUNSET_HOUR_LOCAL: float = 19.0
 PBL_WEST_DEEPENING_M_PER_DEG: float = 50.0
 PBL_REFERENCE_LON: float = -65.0  # east edge; deepening measured west of here
 PBL_FIXED_DEFAULT_M: float = PBL_DAYTIME_M  # ConstantPBL convenience default
+#: Nearest-time tolerance (hours) for the assessed 3-hourly PBLH lookup
+#: (pbl.GriddedPBL): half the Guo et al. (2024) product's 3-h sampling interval,
+#: so inside temporal coverage the nearest sample always qualifies, while queries
+#: beyond the record's ends (2016, the Oct-2021 gap) fall through to climatology.
+PBLH_TIME_TOLERANCE_H: float = 1.5
 
 # --------------------------------------------------------------------------- #
 # Surface contact  (contact.py)
@@ -117,6 +140,32 @@ CONTACT_FRACTION: float = 1.0
 CONTACT_FRACTION_STILT: float = 0.5
 CONTACT_FRACTION_SODEMANN: float = 1.5
 CONTACT_TAPER_FRACTION: float = 0.25  # top 25% of the contact layer ramps 1->0
+
+# --------------------------------------------------------------------------- #
+# Available surface energy  (insolation.py)
+# --------------------------------------------------------------------------- #
+#: The hour-to-hour weight that footprint.py leaves to a downstream step. Contact
+#: time is multiplied by the surface AVAILABLE ENERGY Rn - G ~= a * DSWF, the
+#: reservoir the Bowen ratio partitions between sensible and latent heating.
+#: Without it, a contact hour at 01 UTC (dark) counts as much as one at 20 UTC.
+SOLAR_CONSTANT_WM2: float = 1361.0
+#: Bulk clear-sky transmissivity, DSWF = S0*cosZ*(B0 + B1*cosZ) (Liu & Jordan
+#: 1960 form): transmissivity rises with sun elevation as air mass falls.
+CLEARSKY_B0: float = 0.60
+CLEARSKY_B1: float = 0.20
+#: a = (Rn - G)/DSWF. Rn/DSWF ~= 0.60-0.70 for vegetated land (albedo 0.15-0.25,
+#: net longwave -60 to -100 W/m2) times (1 - G/Rn), G/Rn ~= 0.05-0.15 vegetated
+#: and 0.2-0.4 bare. Cross-check: 0.55*750 = 413 W/m2 vs H + LE = 400 W/m2 for a
+#: high-plains June afternoon (3%).
+AVAILABLE_ENERGY_COEF: float = 0.55
+AVAILABLE_ENERGY_COEF_BARE: float = 0.42
+AVAILABLE_ENERGY_COEF_VEG: float = 0.58
+
+#: Mean mixed-layer air density used for the column mass m* = RHO_ML * PBLH
+#: (kg/m2), which converts the extensive influence Phi (J/m2) to the intensive
+#: Omega (J/kg). 1.1 kg/m3 is the mixed-layer mean over the high plains
+#: (1.05-1.20 across the domain); good to about 10%.
+RHO_ML_KG_M3: float = 1.10
 
 # --------------------------------------------------------------------------- #
 # Land mask
@@ -187,6 +236,13 @@ SOURCE_WINDOW_HALFWIDTH_DEG: float = 6.0
 #: the kernel follows the actual parcel cloud. The physical ``footprint`` is
 #: never truncated. ``None`` disables truncation.
 KERNEL_CONTAINMENT_FRAC: float = 0.90
+
+#: Below this member count the containment order statistic dist[ceil(0.9*n)-1]
+#: degenerates (at n=4 it is the maximum, so containment silently does nothing)
+#: and sample size leaks into Psi; receptors under this threshold skip
+#: containment entirely and are flagged (HANDOFF.md 8.6 /
+#: UPWIND_INDEX_REVIEW.md F6).
+CONTAINMENT_MIN_PARCELS: int = 20
 
 #: Maximum look-back lag (hours). Bounded in general by soil-moisture memory
 #: (~24 h; Guillod+2015) but capped by this dataset at t_arrival - t_overpass

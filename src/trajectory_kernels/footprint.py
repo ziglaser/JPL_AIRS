@@ -7,10 +7,15 @@ construct (Lin+2003) specialized to surface coupling:
 
     f(x_s, tau) = sum over parcels/steps of  w_contact * land_frac * dt
 
-Two products per receptor: the physical ``footprint`` (hours of land-surface
-contact) and the normalized ``kernel`` (weights sum to 1 WITHIN each lag hour;
-hour-to-hour weighting is deliberately left to a downstream step -- the
-``footprint`` retains the physical contact-hours per lag if you need them).
+Three products per receptor: the physical ``footprint`` (hours of land-surface
+contact), the normalized ``kernel`` (weights sum to 1 WITHIN each lag hour --
+the right object for plotting and per-lag maps), and ``lag_weight`` -- the
+physical mass of each lag hour (the per-lag total of the containment-masked
+footprint) that downstream contractions multiply back in, so that
+Psi = sum_k(w_k S_k) / sum_k(w_k) with w_k the energy weight of hour k
+(UPWIND_INDEX_REVIEW.md 1.6). Without ``lag_weight`` the per-lag kernel
+normalization would cancel the a*DSWF energy weighting across hours and every
+populated hour would count equally.
 
 :func:`footprint_from_trajectories` is the numeric core on plain arrays (unit-
 testable with synthetic parcels); :func:`build_footprint` runs one receptor and
@@ -89,6 +94,7 @@ def footprint_from_trajectories(
     contact_fraction: float = config.CONTACT_FRACTION,
     resample_step_min: float = config.RESAMPLE_STEP_MIN,
     rainout_discount: bool = False,
+    energy_fn: Optional[Callable] = None,
 ) -> np.ndarray:
     """Accumulate the physical footprint ``f[lag, source_lat, source_lon]`` (hours).
 
@@ -99,6 +105,15 @@ def footprint_from_trajectories(
     distance back from the receptor. With ``rainout_discount`` each point is
     down-weighted by the retained-humidity fraction (Sodemann+2008; exact here
     because q is loss-only).
+
+    ``energy_fn`` (same ``(lat, lon, time_utc)`` signature as a PBLModel)
+    weights each contact-hour by the surface energy available to partition
+    into sensible/latent flux at that place and time: a contact hour at
+    midday delivers a real surface imprint to the parcel, a nighttime one
+    almost none. With :class:`insolation.ClearSkyAvailableEnergy` (W m-2)
+    the footprint becomes W m-2 hours of energy-weighted land contact --
+    the Phi capacity integrand of the upwind index. ``None`` keeps the
+    unweighted contact-hours footprint bit-identical to before.
     """
     n_lag = lag_hours.size
     footprint = np.zeros((n_lag, source_lat.size, source_lon.size))
@@ -125,6 +140,9 @@ def footprint_from_trajectories(
         contact = contact_weight(fine["alt"], pbl_depth, fraction=contact_fraction)
         land = np.asarray(land_fn(fine["lat"], fine["lon"]), dtype=float)
         mass = contact * land * _residence_weights(fine_sec)
+        if energy_fn is not None:
+            mass = mass * np.asarray(energy_fn(fine["lat"], fine["lon"], fine_utc),
+                                     dtype=float)
         if rainout_discount and "q" in traj:
             fine_q = np.interp(fine["t_hours"], np.asarray(traj["t_hours"], dtype=float),
                                np.asarray(traj["q"], dtype=float))
@@ -232,12 +250,21 @@ def containment_mask(
     return mask
 
 
-def _normalize_per_lag(footprint: np.ndarray, masked: np.ndarray) -> np.ndarray:
-    """Per-lag kernel: each populated lag slice of ``masked`` sums to 1 over the
-    source cells (the last two axes). A lag whose containment mask removed ALL
-    its mass falls back to the unmasked footprint (possible only when the
-    deposits came from parcels outside the contact-gated cloud); lags with no
-    mass at all are NaN, never fabricated."""
+def _normalize_per_lag(footprint: np.ndarray,
+                       masked: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-lag kernel + the per-lag totals it was normalized by.
+
+    Each populated lag slice of ``masked`` sums to 1 over the source cells
+    (the last two axes). A lag whose containment mask removed ALL its mass
+    falls back to the unmasked footprint (possible only when the deposits came
+    from parcels outside the contact-gated cloud); lags with no mass at all
+    are NaN, never fabricated.
+
+    Returns ``(kernel, lag_weight)`` where ``lag_weight`` (same shape minus
+    the two source axes; 0 for empty lags, never NaN) is the physical mass of
+    each lag hour that the normalization divided out. Downstream contractions
+    multiply it back in so hour-to-hour energy weighting survives
+    (UPWIND_INDEX_REVIEW.md 1.6)."""
     totals = masked.sum(axis=(-2, -1), keepdims=True)
     raw_totals = footprint.sum(axis=(-2, -1), keepdims=True)
     fallback = (totals == 0) & (raw_totals > 0)
@@ -247,7 +274,7 @@ def _normalize_per_lag(footprint: np.ndarray, masked: np.ndarray) -> np.ndarray:
         totals = np.where(fallback, raw_totals, totals)
     with np.errstate(invalid="ignore", divide="ignore"):
         kernel = masked / totals  # 0/0 -> NaN exactly where a lag is empty
-    return kernel
+    return kernel, totals[..., 0, 0]
 
 
 def _default_models(pbl_model, fuzz_kernel, land_fn):
@@ -270,15 +297,28 @@ def _wrap(footprint, source_lat, source_lon, lag_hours,
 
     The kernel is the footprint truncated to the containment ``mask`` (parcel
     cloud support; None = no truncation) and normalized PER LAG HOUR (each lag
-    slice sums to 1); lag hours with no deposited mass are NaN, never
-    fabricated. The ``footprint`` itself is always the full physical field.
+    slice sums to 1) -- unchanged semantics for plotting and per-lag maps;
+    lag hours with no deposited mass are NaN, never fabricated. The
+    ``footprint`` itself is always the full physical field.
+
+    ``lag_weight`` (on ``lag``) is the physical mass the per-lag normalization
+    divided out of each hour -- the hour-to-hour weight that downstream
+    contractions (``apply.apply_kernel(lag_weights=...)``) multiply back in,
+    closing the "hour-to-hour weighting applied downstream" promise. Its units
+    follow the footprint's; empty lags are 0, never NaN.
+
+    ``meta["energy_model"]`` ("UniformEnergy" when no energy weight was
+    applied) selects the footprint units: plain contact-hours, or
+    W m-2 hours when each contact hour was weighted by available surface
+    energy.
     """
-    kernel = _normalize_per_lag(footprint,
-                                footprint if mask is None else footprint * mask)
+    kernel, lag_weight = _normalize_per_lag(
+        footprint, footprint if mask is None else footprint * mask)
     ds = xr.Dataset(
         {
             "footprint": (("lag", "source_lat", "source_lon"), footprint),
             "kernel": (("lag", "source_lat", "source_lon"), kernel),
+            "lag_weight": (("lag",), lag_weight.astype("float32")),
         },
         coords={
             "lag": ("lag", lag_hours.astype(float)),
@@ -288,11 +328,20 @@ def _wrap(footprint, source_lat, source_lon, lag_hours,
             "dlon": ("source_lon", source_lon - target_lon),
         },
     )
-    ds["footprint"].attrs["units"] = "hours of land-surface contact"
+    ds["footprint"].attrs["units"] = (
+        "hours of land-surface contact"
+        if meta.get("energy_model", "UniformEnergy") == "UniformEnergy"
+        else "W m-2 hours (energy-weighted land contact)")
     ds["kernel"].attrs["long_name"] = (
         "influence kernel (truncated to the parcel-cloud containment region; "
         "weights sum to 1 within each lag hour; "
-        "hour-to-hour weighting applied downstream)")
+        "hour-to-hour weighting applied downstream via lag_weight)")
+    ds["lag_weight"].attrs.update({
+        "units": ds["footprint"].attrs["units"],
+        "long_name": ("physical mass of each lag hour (per-lag total of the "
+                      "containment-masked footprint); the hour-to-hour weight "
+                      "downstream contractions multiply back in"),
+    })
     ds.attrs.update({"target_lat": target_lat, "target_lon": target_lon, **meta})
     return ds
 
@@ -310,6 +359,7 @@ def build_footprint(
     receptor_band_m: tuple[float, float] = config.RECEPTOR_BAND_M,
     rainout_discount: bool = False,
     containment_frac: Optional[float] = config.KERNEL_CONTAINMENT_FRAC,
+    energy_fn: Optional[Callable] = None,
 ) -> xr.Dataset:
     """Influence kernel for one receptor (target cell, arrival step 1-6).
 
@@ -319,7 +369,17 @@ def build_footprint(
     provenance attrs (parcel counts, swath split, max available lag). The
     kernel's support is truncated per lag to the region containing
     ``containment_frac`` of the parcel cloud (None disables); the physical
-    footprint is never truncated.
+    footprint is never truncated. ``energy_fn`` weights each contact hour
+    by available surface energy (see :func:`footprint_from_trajectories`).
+
+    Containment is additionally SKIPPED when fewer than
+    ``config.CONTAINMENT_MIN_PARCELS`` parcels arrive: the containment
+    radius is an order statistic of the parcel cloud, which degenerates at
+    small n (with 3 parcels the "90% circle" is just the farthest parcel),
+    so applying it would make the kernel support -- and hence Psi -- a
+    function of sample size rather than of transport. The attr
+    ``containment_applied`` records what happened: 0 = containment disabled
+    or empty receptor, 1 = mask applied, 2 = skipped (n below threshold).
     """
     if arrival_step < 1:
         raise ValueError("arrival_step must be >= 1 (step 0 is the release)")
@@ -341,7 +401,9 @@ def build_footprint(
     if members.size == 0:
         meta = {"n_parcels": 0, "n_early": 0, "n_late": 0, "max_lag_hours": 0.0,
                 "arrival_step": arrival_step, "rainout_discount": int(rainout_discount),
-                "kernel_containment_frac": float(containment_frac or 0.0)}
+                "kernel_containment_frac": float(containment_frac or 0.0),
+                "containment_applied": 0,
+                "energy_model": type(energy_fn).__name__ if energy_fn else "UniformEnergy"}
         empty = np.zeros((1, source_lat.size, source_lon.size))
         ds = _wrap(empty, source_lat, source_lon, np.arange(1, dtype=float),
                    target_lat, target_lon, meta)
@@ -355,11 +417,17 @@ def build_footprint(
     footprint = footprint_from_trajectories(
         trajs, source_lat, source_lon, lag_hours, pbl_model, fuzz_kernel, land_fn,
         contact_fraction=contact_fraction, rainout_discount=rainout_discount,
+        energy_fn=energy_fn,
     )
     mask = None
+    containment_applied = 0
     if containment_frac is not None:
-        mask = containment_mask(source_lat, source_lon, trajs, lag_hours,
-                                pbl_model, contact_fraction, containment_frac)
+        if members.size < config.CONTAINMENT_MIN_PARCELS:
+            containment_applied = 2
+        else:
+            mask = containment_mask(source_lat, source_lon, trajs, lag_hours,
+                                    pbl_model, contact_fraction, containment_frac)
+            containment_applied = 1
     swath = arrays["swath"][members]
     meta = {
         "n_parcels": int(members.size),
@@ -371,6 +439,8 @@ def build_footprint(
         "contact_fraction": float(contact_fraction),
         "rainout_discount": int(rainout_discount),
         "kernel_containment_frac": float(containment_frac or 0.0),  # 0 = off
+        "containment_applied": containment_applied,
+        "energy_model": type(energy_fn).__name__ if energy_fn else "UniformEnergy",
     }
     ds = _wrap(footprint, source_lat, source_lon, lag_hours,
                target_lat, target_lon, meta, mask=mask)
@@ -427,6 +497,7 @@ def build_all(
     window_halfwidth_deg: float = config.SOURCE_WINDOW_HALFWIDTH_DEG,
     rainout_discount: bool = False,
     containment_frac: Optional[float] = config.KERNEL_CONTAINMENT_FRAC,
+    energy_fn: Optional[Callable] = None,
 ) -> xr.Dataset:
     """Kernels for every grid cell and arrival step, on a relative source window.
 
@@ -435,7 +506,30 @@ def build_all(
     the primary NetCDF schema. Empty receptors have ``n_parcels == 0``, zero
     footprint and NaN kernel -- honest gaps, never fabricated. Kernels (not
     footprints) are truncated per lag to the ``containment_frac`` parcel-cloud
-    region (None disables).
+    region (None disables). ``energy_fn`` weights each contact hour by
+    available surface energy (see :func:`footprint_from_trajectories`).
+
+    ``lag_weight`` (float32, on (arrival_step, target_lat, target_lon, lag))
+    is the physical mass of each lag hour -- the per-lag total of the
+    containment-masked footprint, in the footprint's units, 0 for empty lags
+    (never NaN). The kernel itself stays per-lag normalized (unchanged
+    semantics for plotting and per-lag maps); ``lag_weight`` is the
+    hour-to-hour weight that downstream contractions multiply back in
+    (``apply.apply_kernel(lag_weights=...)``), so that
+    Psi = sum_k(w_k S_k)/sum_k(w_k) rather than an equal-hour mean
+    (UPWIND_INDEX_REVIEW.md 1.6).
+
+    The ``arrival_times_utc`` attr lists the shared hourly UTC arrival slot
+    per arrival step (parcel 0 is representative); on a parcel-free day it is
+    an empty list -- the marker predictors should treat as "no arrivals".
+
+    Receptors with fewer than ``config.CONTAINMENT_MIN_PARCELS`` arriving
+    parcels skip the containment mask: its radius is an order statistic of
+    the parcel cloud, which degenerates at small n and would make the kernel
+    support -- and hence Psi -- a function of sample size rather than of
+    transport. ``containment_applied`` (int8, per receptor) records the
+    outcome: 0 = containment disabled globally or receptor empty, 1 = mask
+    applied, 2 = skipped because n_parcels < CONTAINMENT_MIN_PARCELS.
     """
     pbl_model, fuzz_kernel, land_fn = _default_models(pbl_model, fuzz_kernel, land_fn)
     arrays = _parcel_arrays(day)
@@ -456,6 +550,7 @@ def build_all(
     footprint = np.zeros(shape, dtype="float32")
     masked = np.zeros(shape, dtype="float32")  # footprint within the containment region
     counts = np.zeros(shape[:3], dtype="int32")
+    applied = np.zeros(shape[:3], dtype="int8")
 
     for s, step in enumerate(arrival_steps):
         cells = _cells_with_arrivals(arrays, step, receptor_band_m, grid_lat, grid_lon)
@@ -466,26 +561,37 @@ def build_all(
                 trajs, source_lat, source_lon, lag_hours,
                 pbl_model, fuzz_kernel, land_fn,
                 contact_fraction=contact_fraction, rainout_discount=rainout_discount,
+                energy_fn=energy_fn,
             ).astype("float32")
             footprint[s, i, j] = fp
             if containment_frac is not None:
-                fp = fp * containment_mask(source_lat, source_lon, trajs, lag_hours,
-                                           pbl_model, contact_fraction, containment_frac)
+                if len(members) < config.CONTAINMENT_MIN_PARCELS:
+                    applied[s, i, j] = 2
+                else:
+                    fp = fp * containment_mask(source_lat, source_lon, trajs,
+                                               lag_hours, pbl_model,
+                                               contact_fraction, containment_frac)
+                    applied[s, i, j] = 1
             masked[s, i, j] = fp
             counts[s, i, j] = len(members)
 
     # per-lag-hour normalization of the containment-truncated footprint: each
     # (receptor, lag) slice sums to 1 over (dlat, dlon); hours with no
-    # deposited mass are NaN
-    kernel = _normalize_per_lag(footprint, masked)
+    # deposited mass are NaN. The divided-out per-lag totals are kept as
+    # lag_weight, the hour-to-hour weight downstream contractions restore.
+    kernel, lag_weight = _normalize_per_lag(footprint, masked)
     del masked
+
+    energy_model = type(energy_fn).__name__ if energy_fn else "UniformEnergy"
 
     dims6 = ("arrival_step", "target_lat", "target_lon", "lag", "dlat", "dlon")
     ds = xr.Dataset(
         {
             "footprint": (dims6, footprint),
             "kernel": (dims6, kernel),
+            "lag_weight": (dims6[:4], lag_weight.astype("float32")),
             "n_parcels": (dims6[:3], counts),
+            "containment_applied": (dims6[:3], applied),
         },
         coords={
             "arrival_step": ("arrival_step", np.asarray(arrival_steps, dtype="int8")),
@@ -496,17 +602,37 @@ def build_all(
             "dlon": ("dlon", dlon),
         },
     )
-    ds["footprint"].attrs["units"] = "hours of land-surface contact"
+    ds["footprint"].attrs["units"] = (
+        "hours of land-surface contact" if energy_model == "UniformEnergy"
+        else "W m-2 hours (energy-weighted land contact)")
     ds["kernel"].attrs["long_name"] = (
         "influence kernel (truncated to the parcel-cloud containment region; "
         "weights sum to 1 within each lag hour per receptor; "
-        "hour-to-hour weighting applied downstream)")
+        "hour-to-hour weighting applied downstream via lag_weight)")
+    ds["lag_weight"].attrs.update({
+        "units": ds["footprint"].attrs["units"],
+        "long_name": ("physical mass of each lag hour (per-lag total of the "
+                      "containment-masked footprint); the hour-to-hour weight "
+                      "downstream contractions multiply back in"),
+    })
+    ds["containment_applied"].attrs["long_name"] = (
+        "containment outcome per receptor: 0 = containment disabled or "
+        "receptor empty, 1 = mask applied, 2 = skipped "
+        "(n_parcels < CONTAINMENT_MIN_PARCELS)")
     ds.attrs.update({
         "contact_fraction": float(contact_fraction),
         "receptor_band_m": list(receptor_band_m),
         "pbl_model": type(pbl_model).__name__,
         "fuzz_model": type(fuzz_kernel).__name__,
+        "energy_model": energy_model,
         "rainout_discount": int(rainout_discount),
         "kernel_containment_frac": float(containment_frac or 0.0),  # 0 = off
+        "containment_min_parcels": int(config.CONTAINMENT_MIN_PARCELS),
+        # steps >= 1 share the hourly UTC arrival slots across all parcels,
+        # so parcel 0 is representative; predictors.m_star reads this.
+        # A parcel-free day has no parcel 0: the empty list marks it.
+        "arrival_times_utc": (
+            [str(arrays["time_utc"][0, s]) for s in arrival_steps]
+            if arrays["time_utc"].shape[0] > 0 else []),
     })
     return ds

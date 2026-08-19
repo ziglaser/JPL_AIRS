@@ -102,6 +102,50 @@ def test_nearest_lookup_does_not_propagate_nan():
     assert fn(s["lat"].values[0], s["lon"].values[1]) == pytest.approx(1.0)
 
 
+def test_lag_weights_restore_hour_to_hour_mass():
+    """REGRESSION (review critical): with lag_weights the result is
+    sum(w S)/sum(w), not the equal-hour mean. The toy kernel splits 0.5/0.5
+    between its own cell (lag 0) and one cell west (lag 1); weights 3:1 and a
+    field of 0.4 (own) / 0.2 (west) give (3*0.4 + 1*0.2)/4 = 0.35."""
+    ds = _toy_kernels()
+    s = _surface(const=0.2, spike_at=None)
+    s.values[np.argmin(np.abs(s["lat"].values - 31.5)),
+             np.argmin(np.abs(s["lon"].values - -94.5))] = 0.4  # own cell
+    lw = np.zeros((1, 3, 3, 2))
+    lw[0, 1, 1] = [3.0, 1.0]
+    infl = A.apply_kernel(ds, s, lag_weights=lw)
+    assert float(infl.sel(arrival_step=3, target_lat=31.5,
+                          target_lon=-94.5)) == pytest.approx(0.35)
+    # default None preserves the equal-hour behaviour: (0.4 + 0.2)/2
+    equal = A.apply_kernel(ds, s)
+    assert float(equal.sel(arrival_step=3, target_lat=31.5,
+                           target_lon=-94.5)) == pytest.approx(0.30)
+
+
+def test_lag_weights_keep_uniform_field_invariant_with_nan_gaps():
+    """A uniform field must return the constant under unequal lag weights even
+    when NaN gaps remove weight -- the NaN-gap renormalization stays intact."""
+    ds = _toy_kernels()
+    s = _surface(const=3.0)
+    s.values[np.argmin(np.abs(s["lat"].values - 32.5)),
+             np.argmin(np.abs(s["lon"].values - -94.5))] = np.nan  # in-window gap
+    lw = np.zeros((1, 3, 3, 2))
+    lw[0, 1, 1] = [3.0, 1.0]
+    infl = A.apply_kernel(ds, s, lag_weights=lw)
+    assert float(infl.sel(arrival_step=3, target_lat=31.5,
+                          target_lon=-94.5)) == pytest.approx(3.0)
+
+
+def test_lag_weights_refused_for_footprint():
+    """The physical footprint already carries its hour weighting; silently
+    ignoring lag_weights would be worse than an error."""
+    ds = _toy_kernels()
+    ds["footprint"] = ds["kernel"]
+    with pytest.raises(ValueError, match="lag_weights"):
+        A.apply_kernel(ds, _surface(const=1.0), which="footprint",
+                       lag_weights=np.ones((1, 3, 3, 2)))
+
+
 def test_min_coverage_blanks_low_data_receptors():
     """With half the kernel mass over NaN, min_coverage=0.6 blanks the receptor."""
     ds = _toy_kernels()

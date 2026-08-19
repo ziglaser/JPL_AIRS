@@ -52,6 +52,7 @@ def apply_kernel(
     empty_to_nan: bool = True,
     min_coverage: float = 0.0,
     return_coverage: bool = False,
+    lag_weights=None,
 ):
     """Convolve the relative-window kernels with a static surface field.
 
@@ -68,10 +69,19 @@ def apply_kernel(
     below this become NaN. ``return_coverage=True`` also returns that fraction.
     Empty receptors (``n_parcels == 0``) are NaN when ``empty_to_nan``, else 0.
 
-    NOTE the kernel is normalized per lag hour (each populated lag slice sums
-    to 1), so with ``which="kernel"`` every populated hour contributes EQUAL
-    weight to the average until the separate hour-to-hour weighting step;
-    ``which="footprint"`` still weights hours by physical contact time.
+    The kernel is normalized per lag hour (each populated lag slice sums to 1),
+    so with ``which="kernel"`` and ``lag_weights=None`` every populated hour
+    contributes EQUAL weight to the average. ``lag_weights`` (an
+    ``xr.DataArray`` or ndarray broadcastable to (arrival_step, target_lat,
+    target_lon, lag) -- normally the kernel dataset's ``lag_weight`` variable,
+    the physical mass of each lag hour) multiplies each lag slice BEFORE the
+    finite-surface renormalization, so the result is exactly
+    sum(w S) / sum(w) over all lags and cells -- the hour-to-hour energy
+    weighting of UPWIND_INDEX_REVIEW.md 1.6 -- with the NaN-gap
+    renormalization intact (a uniform field still returns the constant, and
+    ``coverage`` becomes the weight-retained fraction). Only meaningful for
+    ``which="kernel"``; passing it with ``"footprint"`` raises (the footprint
+    already carries its physical hour weighting).
     """
     surface_fn = surface if callable(surface) else lookup_from_dataarray(surface)
 
@@ -82,12 +92,29 @@ def apply_kernel(
     n_step = kernel_ds.sizes["arrival_step"]
     kernel = kernel_ds[which].values  # (step, tlat, tlon, lag, dlat, dlon)
 
+    lw = None
+    if lag_weights is not None:
+        if which != "kernel":
+            raise ValueError(
+                "lag_weights only applies to which='kernel': the physical "
+                "footprint already carries its hour-to-hour weighting.")
+        if isinstance(lag_weights, xr.DataArray):
+            order = [d for d in ("arrival_step", "target_lat", "target_lon", "lag")
+                     if d in lag_weights.dims]
+            lag_weights = lag_weights.transpose(*order).values
+        lw = np.nan_to_num(np.asarray(lag_weights, dtype=float), nan=0.0)
+        lw = np.broadcast_to(lw, kernel.shape[:4])  # (step, tlat, tlon, lag)
+
     influence = np.full((n_step, tlat.size, tlon.size), np.nan)
     coverage = np.full((n_step, tlat.size, tlon.size), np.nan)
     for i, target_lat in enumerate(tlat):
         source_lats = target_lat + dlat
         for j, target_lon in enumerate(tlon):
             block = np.nan_to_num(kernel[:, i, j], nan=0.0)  # (step, lag, dlat, dlon)
+            if lw is not None:
+                # restore the physical hour-to-hour mass BEFORE the finite-
+                # surface renormalization: the result is sum(w S) / sum(w)
+                block = block * lw[:, i, j][:, :, None, None]
             total_weight = block.sum(axis=(1, 2, 3))
             if not np.any(total_weight > 0):
                 continue
