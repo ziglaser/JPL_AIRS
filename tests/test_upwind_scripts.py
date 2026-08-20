@@ -823,3 +823,68 @@ def test_main_production_run_not_stamped_fallback(upw_mod, tmp_path,
                          "covered by the dev smoke run on the demo day")
 def test_build_upwind_features_full_driver():
     ...
+
+
+# --------------------------------------------------------------------------- #
+# merge pass 2: the multi-year Omega climatology and UPW_omega_anom
+# --------------------------------------------------------------------------- #
+def _write_companion(path, year, omega_value):
+    """A minimal yearly companion: UPW_omega constant per file, two June days
+    and one July day, 2 slots, a 1x1 grid -- enough for month grouping."""
+    dates = np.array([f"{year}-06-10", f"{year}-06-20", f"{year}-07-05"],
+                     dtype="datetime64[ns]")
+    om = np.full((3, 2, 1, 1), float(omega_value))
+    om[2] += 100.0  # July offset so the two months have distinct climatologies
+    ds = xr.Dataset(
+        {"UPW_omega": (("date", "time", "lat", "lon"), om)},
+        coords={"date": dates, "time": [1, 2], "lat": [40.5], "lon": [-90.5]})
+    ds.to_netcdf(path)
+
+
+@pytest.fixture(scope="module")
+def merge_mod():
+    return _load_script("merge_upwind_features")
+
+
+def test_omega_clim_requires_two_years(merge_mod, tmp_path):
+    _write_companion(tmp_path / "UPWIND_FEATURES_2019.nc", 2019, 1000.0)
+    with pytest.raises(SystemExit, match=">= 2 merged years"):
+        merge_mod.build_omega_climatology(tmp_path, min_samples=1)
+
+
+def test_omega_clim_and_anomaly_arithmetic(merge_mod, tmp_path):
+    # two years, June omegas 1000 and 3000 -> June clim 2000; July +100 each
+    _write_companion(tmp_path / "UPWIND_FEATURES_2019.nc", 2019, 1000.0)
+    _write_companion(tmp_path / "UPWIND_FEATURES_2020.nc", 2020, 3000.0)
+    clim_path = merge_mod.build_omega_climatology(tmp_path, min_samples=1)
+    assert clim_path.name == "omega_clim_2019-2020.nc"
+    clim = xr.open_dataset(clim_path)
+    assert float(clim["omega_clim"].sel(month=6).isel(time=0)) == 2000.0
+    assert float(clim["omega_clim"].sel(month=7).isel(time=0)) == 2100.0
+    assert int(clim["omega_clim_n"].sel(month=6).isel(time=0)) == 4
+
+    # min_samples guard: June pools 4 days across the two years, July only 2
+    thin = merge_mod.build_omega_climatology(
+        tmp_path, min_samples=3, out_path=tmp_path / "thin.nc")
+    thin_ds = xr.open_dataset(thin)
+    assert np.isfinite(thin_ds["omega_clim"].sel(month=6)).all()
+    assert thin_ds["omega_clim"].sel(month=7).isnull().all()
+
+    # pass 2 amend: 2019 June anomaly = 1000 - 2000 = -1000; July = -1000 too
+    out = merge_mod.add_omega_anom(tmp_path / "UPWIND_FEATURES_2019.nc", clim_path)
+    amended = xr.open_dataset(out)
+    anom = amended["UPW_omega_anom"]
+    assert anom.attrs["feature_tier"] == "ablation"
+    np.testing.assert_allclose(anom.values, -1000.0)
+    assert "omega_clim" in amended.attrs
+    # the amend is idempotent-safe: original variables untouched
+    np.testing.assert_allclose(
+        amended["UPW_omega"].sel(date="2019-06-10").values, 1000.0)
+
+
+def test_add_omega_anom_missing_companion_exits(merge_mod, tmp_path):
+    _write_companion(tmp_path / "UPWIND_FEATURES_2019.nc", 2019, 1000.0)
+    _write_companion(tmp_path / "UPWIND_FEATURES_2020.nc", 2020, 3000.0)
+    clim_path = merge_mod.build_omega_climatology(tmp_path, min_samples=1)
+    with pytest.raises(SystemExit, match="merge that year first"):
+        merge_mod.add_omega_anom(tmp_path / "UPWIND_FEATURES_2021.nc", clim_path)

@@ -88,6 +88,7 @@ FEATURE_TIERS: dict[str, str] = {
     "containment_applied": "honesty",
     "gamma_gap_mml": "core", "gamma_gap_mu": "core",
     "pblh_anom": "core", "pblh": "honesty",
+    "omega_anom": "ablation",
 }
 
 
@@ -314,6 +315,103 @@ def build_companion(fcst: xr.Dataset, daily_files: dict,
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Pass 2: the multi-year Omega climatology and UPW_omega_anom
+# --------------------------------------------------------------------------- #
+def build_omega_climatology(out_dir: Path, min_samples: int = 10,
+                            out_path: Path | None = None) -> Path:
+    """Pool UPW_omega from every merged year into a (month, slot, cell) mean.
+
+    Omega is extensive in time, so its raw distribution shifts with arrival
+    slot and season; the anomaly against this climatology is the
+    slot-comparable variant (ablation tier -- the forest-native treatment is
+    conditioning on the slot feature, review discussion 2026-08-19).
+
+    MULTI-YEAR ONLY, enforced: a single year's climatology would subtract that
+    specific month-of-that-year's mean, silently erasing the interannual
+    signal (a uniformly dry June would read as neutral). Zach's requirement,
+    19 Aug 2026. Cells/months pooling fewer than ``min_samples`` finite days
+    are NaN, never thinly estimated.
+    """
+    files = sorted(Path(out_dir).glob("UPWIND_FEATURES_*.nc"))
+    years = [f.stem.rsplit("_", 1)[-1] for f in files]
+    if len(files) < 2:
+        raise SystemExit(
+            f"omega climatology needs >= 2 merged years, found {len(files)} in "
+            f"{out_dir} ({years or 'none'}): merge more years first (the "
+            "anomaly is only meaningful against a multi-year base).")
+    omega = xr.concat(
+        [xr.open_dataset(f)["UPW_omega"].load() for f in files], dim="date")
+
+    month = omega["date"].dt.month
+    mean = omega.groupby(month).mean("date")
+    n = omega.notnull().groupby(month).sum("date").astype("int32")
+    clim = mean.where(n >= min_samples)
+
+    ds = xr.Dataset({
+        "omega_clim": clim.assign_attrs(
+            units="J kg-1",
+            long_name="multi-year mean UPW_omega per (month, slot, cell)"),
+        "omega_clim_n": n.assign_attrs(
+            long_name="finite days pooled per (month, slot, cell)"),
+    })
+    ds.attrs.update({
+        "source_files": ", ".join(f.name for f in files),
+        "years": f"{years[0]}-{years[-1]}",
+        "min_samples": int(min_samples),
+        "purpose": "reference for UPW_omega_anom = UPW_omega - omega_clim; "
+                   "rebuild after merging additional years",
+        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+    dest = out_path or Path(out_dir) / f"omega_clim_{years[0]}-{years[-1]}.nc"
+    atomic_to_netcdf(ds, dest, encoding={v: {"zlib": True, "complevel": 4}
+                                         for v in ds.data_vars})
+    return dest
+
+
+def omega_anomaly(omega: xr.DataArray, clim_ds: xr.Dataset,
+                  clim_path: Path) -> xr.DataArray:
+    """UPW_omega minus the multi-year (month, slot, cell) climatology, J/kg."""
+    anom = omega.groupby("date.month") - clim_ds["omega_clim"]
+    anom = anom.drop_vars("month", errors="ignore")
+    anom.attrs = {
+        "units": "J kg-1",
+        "long_name": ("Omega anomaly vs the multi-year (month, slot, cell) "
+                      "climatology: slot-comparable day-to-day departure"),
+        "feature_tier": "ablation",
+        "omega_clim": f"{clim_path} (years {clim_ds.attrs.get('years', '?')})",
+    }
+    return anom
+
+
+def add_omega_anom(companion_path: Path, clim_path: Path) -> Path:
+    """Amend an existing yearly companion with UPW_omega_anom (pass 2).
+
+    Cheaper than re-merging: needs neither the FCST file nor the daily files,
+    only the companion itself and the pooled climatology.
+    """
+    if not companion_path.exists():
+        raise SystemExit(f"{companion_path} not found: merge that year first")
+    with xr.open_dataset(companion_path) as src:
+        out = src.load()
+    with xr.open_dataset(clim_path) as clim_ds:
+        out["UPW_omega_anom"] = omega_anomaly(out["UPW_omega"],
+                                              clim_ds.load(), clim_path)
+    out.attrs["omega_clim"] = str(clim_path)
+    encoding = {name: {"zlib": True, "complevel": 4} for name in out.data_vars}
+    atomic_to_netcdf(out, companion_path, encoding=encoding)
+    return companion_path
+
+
+def _newest_omega_clim(out_dir: Path) -> Path:
+    hits = sorted(Path(out_dir).glob("omega_clim_*.nc"))
+    if not hits:
+        raise SystemExit(
+            f"no omega_clim_*.nc in {out_dir}: run --build-omega-clim first "
+            "(after merging >= 2 years), or pass --omega-clim explicitly.")
+    return hits[-1]
+
+
 def atomic_to_netcdf(ds: xr.Dataset, out_path: Path, encoding: dict | None = None) -> None:
     """Write ``ds`` to ``out_path`` atomically: tmp file in the same dir, then rename.
 
@@ -351,7 +449,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Merge per-day upwind kernel features and the "
                     "trajectory-free features into UPWIND_FEATURES_<YYYY>.nc, "
                     "a companion to FCST_SMAP_MRMS_<YYYY>.nc.")
-    p.add_argument("--year", type=int, required=True)
+    p.add_argument("--year", type=int, default=None,
+                   help="year to merge/amend (required except with "
+                        "--build-omega-clim)")
     p.add_argument("--daily-dir", type=Path,
                    default=config.RESULTS_DIR / "upwind_features" / "daily",
                    help="directory of per-day UPW_<YYYYMMDD>.nc files; the "
@@ -369,12 +469,45 @@ def parse_args(argv=None) -> argparse.Namespace:
                    default=config.RESULTS_DIR / "upwind_features")
     p.add_argument("--force", action="store_true",
                    help="overwrite an existing output file")
+    # Pass 2 (after ALL years are merged): the multi-year Omega climatology
+    # and the slot-comparable anomaly. Multi-year only, by design.
+    p.add_argument("--build-omega-clim", action="store_true",
+                   help="pool UPW_omega across every UPWIND_FEATURES_*.nc in "
+                        "--out-dir into omega_clim_<y0>-<y1>.nc, then exit "
+                        "(requires >= 2 merged years)")
+    p.add_argument("--add-omega-anom", action="store_true",
+                   help="amend the existing companion for --year with "
+                        "UPW_omega_anom against --omega-clim (defaults to the "
+                        "newest omega_clim_*.nc in --out-dir)")
+    p.add_argument("--omega-clim", type=Path, default=None,
+                   help="pooled multi-year climatology file; with a normal "
+                        "merge, adds UPW_omega_anom in one pass (useful when "
+                        "re-merging after the record was extended)")
+    p.add_argument("--omega-clim-out", type=Path, default=None,
+                   help="output path for --build-omega-clim (default: "
+                        "<out-dir>/omega_clim_<y0>-<y1>.nc)")
+    p.add_argument("--omega-min-samples", type=int, default=10,
+                   help="minimum finite days per (month, slot, cell) pool; "
+                        "thinner pools are NaN in the climatology")
     return p.parse_args(argv)
 
 
 def main(argv=None) -> Path:
     args = parse_args(argv)
+
+    if args.build_omega_clim:
+        dest = build_omega_climatology(args.out_dir, args.omega_min_samples,
+                                       args.omega_clim_out)
+        print(f"wrote {dest}")
+        return dest
+    if args.year is None:
+        raise SystemExit("--year is required (except with --build-omega-clim)")
     out_path = args.out_dir / f"UPWIND_FEATURES_{args.year}.nc"
+    if args.add_omega_anom:
+        clim_path = args.omega_clim or _newest_omega_clim(args.out_dir)
+        add_omega_anom(out_path, clim_path)
+        print(f"amended {out_path} with UPW_omega_anom (clim: {clim_path})")
+        return out_path
     if out_path.exists() and not args.force:
         raise SystemExit(f"{out_path} exists; pass --force to overwrite")
 
@@ -392,6 +525,11 @@ def main(argv=None) -> Path:
             "scripts/build_upwind_features.py first, or pass --no-daily for "
             "an intentionally trajectory-free build.")
     out = build_companion(fcst, daily_files, args.pblh_3hrly, args.pblh_clim)
+    if args.omega_clim is not None:
+        with xr.open_dataset(args.omega_clim) as clim_ds:
+            out["UPW_omega_anom"] = omega_anomaly(out["UPW_omega"],
+                                                  clim_ds.load(), args.omega_clim)
+        out.attrs["omega_clim"] = str(args.omega_clim)
     out.attrs["daily_files_found"] = len(daily_files)
     out.attrs["daily_dir"] = "(none: --no-daily)" if daily_dir is None else str(daily_dir)
     out.attrs["command"] = "scripts/merge_upwind_features.py " + " ".join(

@@ -546,15 +546,28 @@ for Y in 2017 2018 2019 2020 2021; do
     UPWIND_YEAR=$Y sbatch --array=0-274%40 slurm/upwind_features.sbatch
 done                                                         # §4.2, per day
 for Y in 2017 2018 2019 2020 2021; do
-    UPWIND_YEAR=$Y sbatch slurm/upwind_merge.sbatch \
-        --daily-dir "${JPL_AIRS_RESULTS:-results}/upwind_features/daily"
+    UPWIND_YEAR=$Y sbatch slurm/upwind_merge.sbatch
 done                                                         # §4.2 merge
+
+# Pass 2, AFTER all years are merged: the multi-year Omega climatology and
+# the slot-comparable UPW_omega_anom (ablation tier; cheap, login node OK)
+python scripts/merge_upwind_features.py --build-omega-clim
+for Y in 2017 2018 2019 2020 2021; do
+    python scripts/merge_upwind_features.py --year $Y --add-omega-anom
+done
 ```
 
-The merge's `--daily-dir` must be the features array's `--out-dir`
-(default `<results>/upwind_features/daily`); it is passed explicitly because
-`merge_upwind_features.py` defaults `--daily-dir` to `None`, a
-trajectory-free-only build with all kernel-borne features NaN.
+The merge's `--daily-dir` defaults to the features array's own `--out-dir`
+default (`<results>/upwind_features/daily`) so the handoff cannot silently
+disagree; `--no-daily` is the explicit trajectory-free mode. `UPW_omega_anom`
+is computed against a **multi-year only** (month, slot, cell) climatology —
+`--build-omega-clim` refuses to run on fewer than two merged years, because a
+within-year base would subtract that month-of-that-year's mean and erase the
+interannual signal. It exists because Ω is extensive in time (a 00 UTC
+arrival integrates more, and sunnier, hours than a 21 UTC one), so raw Ω
+distributions shift by arrival slot; the anomaly is the slot-comparable
+variant. It ships as **ablation** tier — the forest-native treatment of the
+slot shift is conditioning on the slot feature, not rescaling.
 
 Array index → date: task *N* is the *N*-th day (0-based) of Mar 1–Nov 30,
 the 275-day Mar–Nov season. All three jobs are idempotent (skip-if-exists /

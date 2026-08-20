@@ -6,13 +6,12 @@
 #SBATCH --output=logs/upwind_merge_%j.out
 # Per-year merge (UPWIND_INDEX_REVIEW.md section 4.2, final step): concatenate
 # the per-day upwind predictor files for $UPWIND_YEAR onto the FCST_SMAP_MRMS
-# (date, time, lat, lon) axes as UPW_* variables. Submit one year as e.g.
-#   UPWIND_YEAR=2019 sbatch slurm/upwind_merge.sbatch \
-#       --daily-dir "${JPL_AIRS_RESULTS:-results}/upwind_features/daily"
-# --daily-dir must be the features array's --out-dir; pass the features step's
-# default (<results>/upwind_features/daily) explicitly, because
-# merge_upwind_features.py defaults --daily-dir to None (a trajectory-free-only
-# build with all kernel-borne features NaN).
+# (date, time, lat, lon) axes as UPW_* variables. Submit one year as
+#   UPWIND_YEAR=2019 sbatch slurm/upwind_merge.sbatch
+# --daily-dir defaults to the features array's own --out-dir default
+# (<results>/upwind_features/daily), so the handoff cannot silently disagree;
+# override both together if you moved it. --no-daily is the explicit
+# trajectory-free mode (kernel-borne features NaN).
 # Extra args pass through to scripts/merge_upwind_features.py. Partition/
 # account/gres are injected at submit time via SBATCH_PARTITION /
 # SBATCH_ACCOUNT / SBATCH_GRES -- do not hardcode cluster names here.
@@ -28,8 +27,16 @@
 #       UPWIND_YEAR=$Y sbatch --array=0-274%40 slurm/upwind_features.sbatch
 #   done
 #   for Y in 2017 2018 2019 2020 2021; do
-#       UPWIND_YEAR=$Y sbatch slurm/upwind_merge.sbatch \
-#           --daily-dir "${JPL_AIRS_RESULTS:-results}/upwind_features/daily"
+#       UPWIND_YEAR=$Y sbatch slurm/upwind_merge.sbatch
+#   done
+#
+# Pass 2 (AFTER all years are merged) -- the multi-year Omega climatology and
+# the slot-comparable UPW_omega_anom (ablation tier, not auto-included in the
+# forest; multi-year ONLY by design -- a within-year base would erase the
+# interannual signal). Cheap (minutes), run on the login node or as one job:
+#   python scripts/merge_upwind_features.py --build-omega-clim   # >= 2 years
+#   for Y in 2017 2018 2019 2020 2021; do
+#       python scripts/merge_upwind_features.py --year $Y --add-omega-anom
 #   done
 
 set -euo pipefail
