@@ -28,10 +28,27 @@ from pathlib import Path
 # Paths
 # --------------------------------------------------------------------------- #
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
-#: Data root: the JPL_AIRS_DATA env var when set (dev: /mnt/d/JPL_AIRS/data,
-#: cluster: the AIRS_SMAP_Front_data root), else the repo-local data/ tree --
-#: the same convention as convection_skill.config and the slurm scripts.
-DATA_DIR: Path = Path(os.environ.get("JPL_AIRS_DATA", REPO_ROOT / "data"))
+#: Data root resolution (mirrors slurm/env.sh so login-node runs need no
+#: exports): the JPL_AIRS_DATA env var when set (explicit override always
+#: wins), else the first existing known machine layout -- the cluster root,
+#: the dev "My Passport" drive -- else the repo-local data/ tree.
+#: os.path.isdir (not Path.is_dir) because a stale WSL drvfs mount raises
+#: ENODEV from stat, which Path.is_dir propagates but os.path.isdir absorbs.
+def _first_dir(*candidates: Path) -> Path:
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return Path(cand)
+    return Path(candidates[-1])
+
+
+if "JPL_AIRS_DATA" in os.environ:
+    DATA_DIR: Path = Path(os.environ["JPL_AIRS_DATA"])
+else:
+    DATA_DIR = _first_dir(
+        Path("/gpfs/scratch/smap-convection/AIRS_SMAP_Front_data"),
+        Path("/mnt/d/JPL_AIRS/data"),
+        REPO_ROOT / "data",
+    )
 RESULTS_DIR: Path = Path(os.environ.get("JPL_AIRS_RESULTS", REPO_ROOT / "results"))
 #: Global 1-deg fractional land-sea mask (variable ``lsm``). The historical
 #: location was <data root>/lsm.nc; current data trees carry it at

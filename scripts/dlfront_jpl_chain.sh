@@ -420,7 +420,19 @@ run_local() {  # run_local <label> <module> <args...>
 # system python lacks xarray/requests and would abort the chain under set -e
 activate_env() {
     [ "${CONDA_DEFAULT_ENV:-}" = fronts-tf ] && return 0
-    source "${CONDA_PREFIX_ROOT:-$HOME/miniconda3}/etc/profile.d/conda.sh"
+    # conda bootstrap, robust to install location: explicit CONDA_PREFIX_ROOT wins;
+    # else ask the conda on PATH (sbatch propagates the submission environment);
+    # else probe the common install dirs.
+    if [[ -n "${CONDA_PREFIX_ROOT:-}" ]]; then
+        source "$CONDA_PREFIX_ROOT/etc/profile.d/conda.sh"
+    elif command -v conda >/dev/null 2>&1; then
+        source "$(conda info --base)/etc/profile.d/conda.sh"
+    else
+        for _c in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" "$HOME/mambaforge"; do
+            if [[ -f "$_c/etc/profile.d/conda.sh" ]]; then source "$_c/etc/profile.d/conda.sh"; break; fi
+        done
+    fi
+    command -v conda >/dev/null 2>&1 || { echo "conda not found: set CONDA_PREFIX_ROOT to the conda install root" >&2; exit 1; }
     conda activate fronts-tf
 }
 
