@@ -104,14 +104,19 @@ class TalliedPBL(PBLModel):
 def resolve_day_dir(traj_root: Path, yyyymmdd: str) -> Path | None:
     """First existing per-day directory under the archive root, else None.
 
-    The cluster archive layout is not yet confirmed (review open item 1), so
-    the known dev layout (doubled wrf27km_<date> nesting, as on D:) and the
-    two plausible flat layouts are all tried, in order of specificity.
+    ONLY the confirmed cluster archive layout is accepted (Zach, 2026-08-19,
+    closing review open item 1): year-nested
+    ``<root>/YYYY/wrf27km_<YYYYMMDD>``, with the doubled-day variant
+    ``.../wrf27km_<YYYYMMDD>/wrf27km_<YYYYMMDD>`` (as the dev D: copy has)
+    preferred when present. Anything else is a miss -- guessing at alternative
+    layouts risks silently loading the wrong day. To run against a
+    differently-arranged tree (e.g. the dev HYSPLIT_demo copy), symlink it
+    into shape: ``<root>/2019/wrf27km_20190605 -> .../wrf27km_20190605``.
     """
+    year = yyyymmdd[:4]
     candidates = (
-        traj_root / f"wrf27km_{yyyymmdd}" / f"wrf27km_{yyyymmdd}",
-        traj_root / f"wrf27km_{yyyymmdd}",
-        traj_root / yyyymmdd,
+        traj_root / year / f"wrf27km_{yyyymmdd}" / f"wrf27km_{yyyymmdd}",
+        traj_root / year / f"wrf27km_{yyyymmdd}",
     )
     for cand in candidates:
         if cand.is_dir():

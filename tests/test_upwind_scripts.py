@@ -106,8 +106,9 @@ def _write_granule(path: Path, release: np.datetime64,
 
 @pytest.fixture()
 def synthetic_day_dir(tmp_path):
-    day_dir = tmp_path / "wrf27km_20190605"
-    day_dir.mkdir()
+    # the confirmed cluster archive layout: <root>/YYYY/wrf27km_<YYYYMMDD>
+    day_dir = tmp_path / "2019" / "wrf27km_20190605"
+    day_dir.mkdir(parents=True)
     for granule, release in _GRANULE_RELEASES.items():
         _write_granule(
             day_dir / f"nogrid_wrf27km_GOOD_20190605_{granule}.nc", release)
@@ -635,17 +636,19 @@ def upw_mod():
 
 def test_resolve_day_dir_precedence(upw_mod, tmp_path):
     root = tmp_path
-    doubled = root / "wrf27km_20190605" / "wrf27km_20190605"
-    doubled.mkdir(parents=True)
+    # ONLY the confirmed year-nested cluster layout resolves; the old flat and
+    # root-doubled layouts are deliberate misses (Zach, 2026-08-19: guessing
+    # at alternative layouts risks silently loading the wrong day)
+    (root / "wrf27km_20190605" / "wrf27km_20190605").mkdir(parents=True)
     (root / "20190605").mkdir()
-    # doubled nesting wins over the flat layouts when both exist
-    assert upw_mod.resolve_day_dir(root, "20190605") == doubled
-    # single nesting: the wrf27km_<date> dir itself
-    (root / "wrf27km_20190606").mkdir()
-    assert upw_mod.resolve_day_dir(root, "20190606") == root / "wrf27km_20190606"
-    # bare-date layout
-    (root / "20190607").mkdir()
-    assert upw_mod.resolve_day_dir(root, "20190607") == root / "20190607"
+    assert upw_mod.resolve_day_dir(root, "20190605") is None
+    # the archive layout: <root>/YYYY/wrf27km_<date>
+    nested = root / "2019" / "wrf27km_20190605"
+    nested.mkdir(parents=True)
+    assert upw_mod.resolve_day_dir(root, "20190605") == nested
+    # its doubled-day variant outranks the single one when present
+    (nested / "wrf27km_20190605").mkdir()
+    assert upw_mod.resolve_day_dir(root, "20190605") == nested / "wrf27km_20190605"
     # absent day: None (an expected gap, not an error)
     assert upw_mod.resolve_day_dir(root, "20190699") is None
 
@@ -727,7 +730,7 @@ def _builder_world(tmp_path, synthetic_day_dir, with_pblh: bool = True):
             coords={"time": _PBLH_STAMPS, "lat": _MERGE_LAT, "lon": _MERGE_LON},
         ).to_netcdf(pblh_path)
     return ["--date", "2019-06-05",
-            "--traj-root", str(synthetic_day_dir.parent),
+            "--traj-root", str(synthetic_day_dir.parent.parent),
             "--out-dir", str(tmp_path / "daily_out"),
             "--fcst-dir", str(fcst_dir),
             "--baseline", str(baseline_path),
