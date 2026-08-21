@@ -702,7 +702,34 @@ def check_magnitude_realism(pool: Pool, out_dir: Path) -> dict:
             "detail": verdict, "figures": [figp]}
 
 
-def check_event_case_study(bundles: list[YearBundle], out_dir: Path) -> dict:
+def _render_day_panel(dstr: str, fcst_dir: Path, daily_dir: Path,
+                      out_dir: Path) -> tuple[Path | None, str | None]:
+    """The six-panel one-day diagnosis (scripts/plot_upwind_day.py) for one
+    case date, if its daily file exists. Returns (figure_path, skip_reason).
+
+    Imported lazily by path (scripts/ is not a package) with sys.modules
+    registration; any failure skips THIS panel with a reason, never the check
+    (the 2x2 case figure above is the load-bearing artifact).
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plot_upwind_day", Path(__file__).parent / "plot_upwind_day.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["plot_upwind_day"] = mod
+        spec.loader.exec_module(mod)
+        out = mod.render_day(
+            dstr, arrival_step=4, daily_dir=daily_dir, fcst_dir=fcst_dir,
+            out=out_dir / f"qa5_day_{dstr.replace('-', '')}_s4.png")
+        return out, None
+    except FileNotFoundError as err:
+        return None, f"{dstr}: six-panel skipped ({err})"
+    except Exception as err:  # noqa: BLE001 - a plot must never sink the check
+        return None, f"{dstr}: six-panel failed ({type(err).__name__}: {err})"
+
+
+def check_event_case_study(bundles: list[YearBundle], out_dir: Path,
+                           daily_dir: Path | None = None) -> dict:
     """QA 5 -- eyeball the machinery on the days that matter.
 
     For the top-3 domain-total MRMS days per year: previous-day rain, the
@@ -711,8 +738,14 @@ def check_event_case_study(bundles: list[YearBundle], out_dir: Path) -> dict:
     -- always PASS -- but the fastest way to see a lon-flip, a units slip, or
     a kernel reading the wrong day. Soil anomalies diverge (BrBG, centered 0);
     rain is sequential Blues.
+
+    When the case date has a per-day UPW file, the six-panel one-day
+    diagnosis (plot_upwind_day.py: SM anomaly, winds, Psi, remote content,
+    Omega, assessed PBLH -- Zach's diagnosis layout, 2026-08-21) is rendered
+    alongside; absent inputs skip that panel with a note, never the check.
     """
     name = "event_case_study"
+    day_notes: list[str] = []
     usable = [b for b in bundles if b.kernel_valid and b.fcst is not None]
     if not usable:
         return _skip(name, "needs a kernel-valid year with an FCST file "
@@ -769,11 +802,21 @@ def check_event_case_study(bundles: list[YearBundle], out_dir: Path) -> dict:
                     fig, 5, f"{name} {dstr}", "PASS",
                     f"domain MRMS total rank <= 3 in {b.year}",
                     out_dir / f"qa5_case_{b.year}_{dstr.replace('-', '')}.png"))
+                if daily_dir is not None:
+                    panel, note = _render_day_panel(
+                        dstr, Path(b.fcst).parent, daily_dir, out_dir)
+                    if panel is not None:
+                        figures.append(str(panel))
+                    else:
+                        day_notes.append(note)
     if not figures:
         return _skip(name, f"{MRMS_AV_VAR} absent from every FCST file")
+    detail = "visual artifact (always PASS); cases: " + ", ".join(chosen)
+    if day_notes:
+        detail += "; " + "; ".join(day_notes)
     return {"name": name, "status": "PASS",
             "metrics": {"case_dates": chosen},
-            "detail": "visual artifact (always PASS); cases: " + ", ".join(chosen),
+            "detail": detail,
             "figures": figures}
 
 
@@ -992,7 +1035,7 @@ def main(argv=None) -> int:
         check_upwind_alignment(pool, out_dir),
         check_diurnal_lag_profile(bundles, daily_dir, out_dir),
         check_magnitude_realism(pool, out_dir),
-        check_event_case_study(bundles, out_dir),
+        check_event_case_study(bundles, out_dir, daily_dir=daily_dir),
         check_sample_size_leakage(pool, out_dir),
         check_label_monotonicity(pool, out_dir, args.precip_thresh_mm),
     ]

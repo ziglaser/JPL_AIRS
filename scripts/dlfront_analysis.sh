@@ -106,6 +106,15 @@
 #                      warnings, so the plan can be previewed on a box
 #                      where neither the data root nor the models exist)
 #
+# Logs (reorg 2026-08-21): every run nests its logs under
+# logs/dlfront/analysis/<run-timestamp>/ -- SLURM job .out files
+# (<label>_<jobid>.out, submit-time --output overriding the .sbatch
+# fallbacks; the --wrap move/figure jobs get one too, instead of dumping
+# slurm-<jid>.out into the repo root) and the no-SLURM branch's per-step
+# <label>.log files.  logs/dlfront/analysis/latest/ is a symlink to the
+# newest run, and the same timestamp names the manifest
+# (results/dl_front/analysis_<ts>.txt) so runs pair up by eye.
+#
 # No SLURM?  The script detects the absence of `sbatch` and runs the same
 # steps sequentially in the foreground, exactly like the sibling chains.
 set -euo pipefail
@@ -158,8 +167,20 @@ PERM_DIR=$JPL_AIRS_RESULTS/dl_front/permutation
 EVAL_DIR=$JPL_AIRS_RESULTS/dl_front/test_eval
 ABLATION_EVAL_DIR=$JPL_AIRS_RESULTS/dl_front/ablation_eval
 KRIGED_AIRS=$JPL_AIRS_DATA/front_id/kriged_airs_fcst
-mkdir -p logs "$JPL_AIRS_RESULTS/dl_front" "$PERM_DIR" "$ABLATION_EVAL_DIR"
-MANIFEST=$JPL_AIRS_RESULTS/dl_front/analysis_$(date +%Y%m%d_%H%M%S).txt
+# ONE timestamp per invocation (logs reorg 2026-08-21): shared by the
+# manifest filename and the per-run log dir, so a manifest can always be
+# paired with its logs by eye instead of matching two nearby date stamps.
+RUN_TS=$(date +%Y%m%d_%H%M%S)
+# Per-chain, per-run log nest -- the old flat logs/ had every chain's every
+# run interleaved and was unbrowsable.  Created RIGHT HERE, before any
+# submission: SLURM refuses to START a job whose --output directory does
+# not exist, and submit()/submit_move()/submit_pyjob() below point job
+# output into $LOG_DIR.
+LOG_DIR=logs/dlfront/analysis/$RUN_TS
+mkdir -p "$LOG_DIR" "$JPL_AIRS_RESULTS/dl_front" "$PERM_DIR" "$ABLATION_EVAL_DIR"
+# convenience symlink: logs/dlfront/analysis/latest/ is always the newest run
+ln -sfn "$RUN_TS" logs/dlfront/analysis/latest
+MANIFEST=$JPL_AIRS_RESULTS/dl_front/analysis_$RUN_TS.txt
 {
     echo "# dl_front analysis-only manifest  $(date -Is)"
     echo "# repo=$JPL_AIRS_REPO data=$JPL_AIRS_DATA fcst=$JPL_AIRS_FCST"
@@ -440,6 +461,12 @@ submit() {  # submit <label> <gpu 0|1> <deps colon-joined> <sbatch script> <args
     # --export=ALL: the JPL_AIRS_* roots MUST reach the job even on a
     # cluster whose slurm defaults force --export=NONE.
     local opts=(--export=ALL)
+    # job output nests in this run's $LOG_DIR (mkdir'd at script start --
+    # SLURM refuses to start a job whose --output dir is missing).  This
+    # submit-time -o OVERRIDES the `#SBATCH --output=logs/...` line inside
+    # the slurm/*.sbatch file, which stays as the fallback for hand
+    # submissions.
+    opts+=(--output="$LOG_DIR/${label}_%j.out")
     local part=${SBATCH_PARTITION:-}
     [ "$gpu" = 1 ] && [ -n "${SBATCH_GPU_PARTITION:-}" ] && part=$SBATCH_GPU_PARTITION
     [ -n "$part" ] && opts+=(-p "$part")
@@ -465,6 +492,10 @@ submit() {  # submit <label> <gpu 0|1> <deps colon-joined> <sbatch script> <args
 submit_move() {  # submit_move <label> <deps> <stem>
     local label=$1 deps=$2 stem=$3
     local opts=(--export=ALL)
+    # --wrap jobs have no .sbatch file and hence no #SBATCH --output at all:
+    # without this submit-time --output they dump slurm-<jid>.out into the
+    # repo root.  Nest them in $LOG_DIR like every other job of this run.
+    opts+=(--output="$LOG_DIR/${label}_%j.out")
     [ -n "${SBATCH_PARTITION:-}" ] && opts+=(-p "$SBATCH_PARTITION")
     [ -n "${SBATCH_ACCOUNT:-}" ] && opts+=(-A "$SBATCH_ACCOUNT")
     [ -n "$deps" ] && opts+=("--dependency=afterok:$deps")
@@ -477,7 +508,7 @@ submit_move() {  # submit_move <label> <deps> <stem>
     wrap="$wrap if [ -e \"\$f\" ]; then mv -f \"\$f\" '$ABLATION_EVAL_DIR/'; fi; done"
     if [ "$DRY_RUN" = 1 ]; then
         DRYC=$((DRYC + 1)); SUBMIT_JID=DRY$DRYC
-        note "DRY_RUN [$SUBMIT_JID] sbatch --wrap=\"$wrap\" (afterok:$deps)"
+        note "DRY_RUN [$SUBMIT_JID] sbatch ${opts[*]-} --wrap=\"$wrap\" (afterok:$deps)"
     else
         SUBMIT_JID=$(sbatch --parsable ${opts[@]+"${opts[@]}"} --wrap="$wrap")
         note "submitted $label -> job $SUBMIT_JID (afterok:$deps)"
@@ -499,6 +530,11 @@ submit_pyjob() {
     fi
     croot=${croot:-$HOME/miniconda3}
     local opts=(--export=ALL)
+    # --wrap jobs have no #SBATCH --output fallback: before the logs reorg
+    # (2026-08-21) these figure jobs dumped slurm-<jid>.out into the repo
+    # root.  Nest their output in $LOG_DIR like every other job of this run
+    # (the dir exists -- mkdir'd at script start, which SLURM requires).
+    opts+=(--output="$LOG_DIR/${label}_%j.out")
     [ -n "${SBATCH_PARTITION:-}" ] && opts+=(-p "$SBATCH_PARTITION")
     [ -n "${SBATCH_ACCOUNT:-}" ] && opts+=(-A "$SBATCH_ACCOUNT")
     [ -n "$deps" ] && opts+=("--dependency=afterok:$deps")
@@ -507,7 +543,7 @@ submit_pyjob() {
     wrap="$wrap PYTHONPATH=src $*"
     if [ "$DRY_RUN" = 1 ]; then
         DRYC=$((DRYC + 1)); SUBMIT_JID=DRY$DRYC
-        note "DRY_RUN [$SUBMIT_JID] sbatch --wrap=\"$wrap\"${deps:+ (afterok:$deps)}"
+        note "DRY_RUN [$SUBMIT_JID] sbatch ${opts[*]-} --wrap=\"$wrap\"${deps:+ (afterok:$deps)}"
     else
         SUBMIT_JID=$(sbatch --parsable ${opts[@]+"${opts[@]}"} --wrap="$wrap")
         note "submitted $label -> job $SUBMIT_JID${deps:+ (afterok:$deps)}"
@@ -519,14 +555,14 @@ submit_pyjob() {
 run_local() {  # run_local <label> <module> <args...>
     local label=$1 status=0
     shift
-    note "RUN python -m $*   (log: logs/$label.log)"
+    note "RUN python -m $*   (log: $LOG_DIR/$label.log)"
     if [ "$DRY_RUN" = 1 ]; then
         # never executed -- record a value distinguishable from local-done
         # so a DRY_RUN manifest can't be mistaken for a completed run
         record "$label" DRY_RUN
         return 0
     fi
-    PYTHONPATH=src python -m "$@" > "logs/$label.log" 2>&1 || status=$?
+    PYTHONPATH=src python -m "$@" > "$LOG_DIR/$label.log" 2>&1 || status=$?
     if [ "$status" = 0 ]; then
         record "$label" local-done
     else
@@ -540,12 +576,12 @@ run_local() {  # run_local <label> <module> <args...>
 run_local_script() {
     local label=$1 status=0
     shift
-    note "RUN python $*   (log: logs/$label.log)"
+    note "RUN python $*   (log: $LOG_DIR/$label.log)"
     if [ "$DRY_RUN" = 1 ]; then
         record "$label" DRY_RUN
         return 0
     fi
-    PYTHONPATH=src python "$@" > "logs/$label.log" 2>&1 || status=$?
+    PYTHONPATH=src python "$@" > "$LOG_DIR/$label.log" 2>&1 || status=$?
     if [ "$status" = 0 ]; then
         record "$label" local-done
     else

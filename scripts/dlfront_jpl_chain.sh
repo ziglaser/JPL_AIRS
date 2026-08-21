@@ -103,6 +103,14 @@
 # and krige phases keep their normal skip behaviour -- for the "re-score
 # existing checkpoints, do not retrain" workflow.
 #
+# Logs (reorg 2026-08-21): every run nests its logs under
+# logs/dlfront/main/<run-timestamp>/ -- SLURM job .out files
+# (<label>_<jobid>.out, submit-time --output overriding the .sbatch
+# fallbacks), the no-SLURM branch's per-step <label>.log files, the phase-0
+# acquire tee, and the label-digest probe.  logs/dlfront/main/latest/ is a
+# symlink to the newest run, and the same timestamp names the manifest
+# (results/dl_front/chain_<ts>.txt) so runs pair up by eye.
+#
 # No SLURM?  The script detects the absence of `sbatch` and runs the exact
 # same steps sequentially in the foreground (see the runbook for
 # `setsid nohup` guidance).
@@ -159,8 +167,19 @@ KRIGED_DEGRADED=$JPL_AIRS_DATA/front_id/degraded_reanalysis
 KRIGED_AIRS=$JPL_AIRS_DATA/front_id/kriged_airs_fcst
 SWATH_BANK=$JPL_AIRS_DATA/masks/swath_bank.npz
 QL_DIR=$JPL_AIRS_RESULTS/dl_front/quicklook
-mkdir -p logs "$JPL_AIRS_RESULTS/dl_front"
-MANIFEST=$JPL_AIRS_RESULTS/dl_front/chain_$(date +%Y%m%d_%H%M%S).txt
+# ONE timestamp per invocation (logs reorg 2026-08-21): shared by the
+# manifest filename and the per-run log dir, so a manifest can always be
+# paired with its logs by eye instead of matching two nearby date stamps.
+RUN_TS=$(date +%Y%m%d_%H%M%S)
+# Per-chain, per-run log nest -- the old flat logs/ had every chain's every
+# run interleaved and was unbrowsable.  Created RIGHT HERE, before any
+# submission: SLURM refuses to START a job whose --output directory does
+# not exist, and every submit() below points its job output into $LOG_DIR.
+LOG_DIR=logs/dlfront/main/$RUN_TS
+mkdir -p "$LOG_DIR" "$JPL_AIRS_RESULTS/dl_front"
+# convenience symlink: logs/dlfront/main/latest/ always shows the newest run
+ln -sfn "$RUN_TS" logs/dlfront/main/latest
+MANIFEST=$JPL_AIRS_RESULTS/dl_front/chain_$RUN_TS.txt
 {
     echo "# dl_front JPL chain manifest  $(date -Is)"
     echo "# repo=$JPL_AIRS_REPO data=$JPL_AIRS_DATA fcst=$JPL_AIRS_FCST"
@@ -277,13 +296,13 @@ skip_quicklook() {  # skip_quicklook <build-jid-or-empty> <png-dir>
 LABELS_SHA1=""
 if LABELS_SHA1=$(PYTHONPATH=src python -m dl_front.evaluate_test \
                       label-digest --classes "$CLASSES" --years "$EVAL_YEARS" \
-                      2>logs/label_digest_probe.log); then
+                      2>"$LOG_DIR/label_digest_probe.log"); then
     note "current label digest: $LABELS_SHA1 (classes=$CLASSES years=$EVAL_YEARS)"
 else
     LABELS_SHA1=""
     note "WARNING: could not compute the current label digest (submitting" \
          "shell likely lacks the fronts-tf env -- see" \
-         "logs/label_digest_probe.log).  Label-staleness detection is" \
+         "$LOG_DIR/label_digest_probe.log).  Label-staleness detection is" \
          "DISABLED for this invocation: an eval CSV computed on labels from" \
          "before the 2026-08-17 fix could be silently reused.  Re-run from" \
          "a shell with 'conda activate fronts-tf' to re-enable it."
@@ -375,6 +394,12 @@ submit() {  # submit <label> <gpu 0|1> <deps colon-joined> <sbatch script> <args
     # whose slurm defaults force --export=NONE (silent repo-local fallbacks
     # otherwise)
     local opts=(--export=ALL)
+    # job output nests in this run's $LOG_DIR (mkdir'd at script start --
+    # SLURM refuses to start a job whose --output dir is missing).  This
+    # submit-time -o OVERRIDES the `#SBATCH --output=logs/...` line inside
+    # the slurm/*.sbatch file, which stays as the fallback for hand
+    # submissions.
+    opts+=(--output="$LOG_DIR/${label}_%j.out")
     # GPU jobs prefer SBATCH_GPU_PARTITION when set (e.g. gpu vs the CPU
     # default partition); everything else uses SBATCH_PARTITION as before.
     local part=${SBATCH_PARTITION:-}
@@ -397,7 +422,7 @@ submit() {  # submit <label> <gpu 0|1> <deps colon-joined> <sbatch script> <args
 run_local() {  # run_local <label> <module> <args...>
     local label=$1 status=0
     shift
-    note "RUN python -m $*   (log: logs/$label.log)"
+    note "RUN python -m $*   (log: $LOG_DIR/$label.log)"
     if [ "$DRY_RUN" != 1 ]; then
         # capture the status instead of relying on set -e: inside a function
         # invoked in a `cmd || fallback` list (the non-fatal quicklook calls)
@@ -405,7 +430,7 @@ run_local() {  # run_local <label> <module> <args...>
         # to `record` and return 0.  Returning the real status keeps set -e
         # aborting the chain for every caller NOT in a || list (build/train
         # phases) and lets quicklook callers downgrade it to a note.
-        PYTHONPATH=src python -m "$@" > "logs/$label.log" 2>&1 || status=$?
+        PYTHONPATH=src python -m "$@" > "$LOG_DIR/$label.log" 2>&1 || status=$?
     fi
     if [ "$status" = 0 ]; then
         record "$label" local-done
@@ -445,7 +470,7 @@ if [ "$WITH_ACQUIRE" = 1 ]; then
     else
         activate_env
         PYTHONPATH=src python -m dl_front.acquire_merra2_sfc \
-            2016 2017 2018 2019 2020 2021 2>&1 | tee logs/dlfront_acquire_sfc.log
+            2016 2017 2018 2019 2020 2021 2>&1 | tee "$LOG_DIR/dlfront_acquire_sfc.log"
     fi
     record phase0-acquire foreground
 fi

@@ -33,7 +33,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+
+# tqdm is progress-bar cosmetics only -- an env that predates its addition to
+# slurm/fronts-tf-environment.yml must not lose the figures over it (it
+# silently killed the analysis chain's non-fatal six-panel jobs, 2026-08-21)
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **_kwargs):
+        return iterable
 
 from . import config, dataset, evaluate_test, predict
 from .quicklook import (INK, OUT_OF_DOMAIN_GRAY, _edge_extent, _style_axis,

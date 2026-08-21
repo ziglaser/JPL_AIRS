@@ -32,6 +32,14 @@
 #   setsid nohup bash scripts/dlfront_full_sequence.sh \
 #       > logs/full_sequence.log 2>&1 &
 #
+# logs/full_sequence.log is the ONE deliberately flat log: it is created by
+# the shell redirect above, before this script (and hence its per-run log
+# dir) even starts.  Everything the sequence itself writes -- the six-panel,
+# export and inject logs, plus the export job's SLURM .out -- nests under
+# logs/dlfront/sequence/<run-timestamp>/ (logs/dlfront/sequence/latest/ is a
+# symlink to the newest run); the chains it drives nest their own logs the
+# same way under logs/dlfront/main|ablation/<their-own-timestamp>/.
+#
 # Progress: tail -f logs/full_sequence.log; squeue -u $USER.
 #
 # Failure model: each WAIT polls for the phase's done-marker FILES while
@@ -82,7 +90,12 @@ ENS_DIR=$JPL_AIRS_DATA/front_id/predicted_fronts/$ENS_TAG/1deg_3wide/3hr
 
 log(){ echo "[sequence $(date '+%F %T')] $*"; }
 die(){ log "FATAL: $*"; exit 1; }
-mkdir -p logs
+# ONE timestamp per invocation (logs reorg 2026-08-21); this script has no
+# manifest of its own, so RUN_TS names only the per-run log nest.  The
+# mkdir/symlink live AFTER the FULLSEQ_SOURCE_ONLY hook below so sourcing
+# the helpers for tests creates nothing on disk.
+RUN_TS=$(date +%Y%m%d_%H%M%S)
+LOG_DIR=logs/dlfront/sequence/$RUN_TS
 
 HAVE_SLURM=0
 command -v sbatch > /dev/null 2>&1 && HAVE_SLURM=1
@@ -119,7 +132,7 @@ wait_for(){
             grace=$((grace + 1))
             [ "$grace" -ge 2 ] && die "$label: every watched job left the" \
                 "queue but artifacts are missing (first: $missing) --" \
-                "a job failed; check sacct -j $jids and logs/"
+                "a job failed; check sacct -j $jids and logs/dlfront/"
         else
             grace=0
         fi
@@ -131,6 +144,13 @@ wait_for(){
 # helpers above (for the shell-level tests) without activating conda or
 # running the sequence
 if [ "${FULLSEQ_SOURCE_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
+# Per-run log nest, created before any submission: SLURM refuses to START a
+# job whose --output directory does not exist, and the step-6 export
+# submission below points its job output into $LOG_DIR.
+mkdir -p "$LOG_DIR"
+# convenience symlink: logs/dlfront/sequence/latest/ is always the newest run
+ln -sfn "$RUN_TS" logs/dlfront/sequence/latest
 
 CONDA_ROOT=${CONDA_PREFIX_ROOT:-$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")}
 export CONDA_PREFIX_ROOT="$CONDA_ROOT"
@@ -175,8 +195,8 @@ SIXPANEL_FOLDS=${SIXPANEL_FOLDS:-0}
 for k in $SIXPANEL_FOLDS; do
     log "six-panel figures, fold $k (non-fatal)"
     python -m dl_front.six_panel --fold "$k" \
-        > "logs/full_sequence_six_panel_f$k.log" 2>&1 \
-        || log "six_panel fold $k FAILED (non-fatal, see the log)"
+        > "$LOG_DIR/six_panel_f$k.log" 2>&1 \
+        || log "six_panel fold $k FAILED (non-fatal, see $LOG_DIR/six_panel_f$k.log)"
 done
 
 # ---- step 5: ablation chain (runs concurrently with 6-7) ------------------ #
@@ -208,14 +228,21 @@ if [ "$HAVE_SLURM" = 1 ]; then
     else
         log "step 6: no idle GPU node -> exporting on CPU (job is CPU-capable)"
     fi
-    EXPORT_JID=$(sbatch --parsable --export=ALL ${GPU_OPTS[@]+"${GPU_OPTS[@]}"} \
+    # --output nests the job log in this run's $LOG_DIR (mkdir'd above --
+    # SLURM refuses to start a job whose --output dir is missing); this
+    # submit-time flag OVERRIDES dlfront_export.sbatch's own
+    # `#SBATCH --output=logs/...` line, which stays as the fallback for
+    # hand submissions.
+    EXPORT_JID=$(sbatch --parsable --export=ALL \
+                 --output="$LOG_DIR/export_%j.out" \
+                 ${GPU_OPTS[@]+"${GPU_OPTS[@]}"} \
                  slurm/dlfront_export.sbatch "${EXPORT_ARGS[@]}")
     log "step 6: export submitted -> job $EXPORT_JID"
 else
     log "step 6: no SLURM -> exporting in the foreground"
     EXPORT_JID=""
     python -m dl_front.export_predictions "${EXPORT_ARGS[@]}" \
-        > logs/full_sequence_export.log 2>&1
+        > "$LOG_DIR/export.log" 2>&1
 fi
 wait_for "step6 export ($ENS_TAG $EXPORT_YEARS)" \
          "$EXPORT_TIMEOUT_H" "${EXPORT_JID:-}" "${EXPORT_TARGETS[@]}"
@@ -230,7 +257,7 @@ python scripts/add_front_flags.py --years "$EXPORT_YEARS" --label-source noaa \
     --out-dir     "$JPL_AIRS_DATA/FCST_SMAP_MRMS_fronts" \
     --pred-dir    "$JPL_AIRS_DATA/front_id/predicted_fronts/$ENS_TAG" \
     --pred-tag    "${ENS_TAG#dlfront_}" --force \
-    > logs/full_sequence_inject.log 2>&1
+    > "$LOG_DIR/inject.log" 2>&1
 log "step 7: done -> $JPL_AIRS_DATA/FCST_SMAP_MRMS_fronts"
 
 # ---- final: let the ablation chain drain ----------------------------------- #

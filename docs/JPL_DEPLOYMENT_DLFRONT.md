@@ -205,11 +205,13 @@ it from your terminal:
 ```bash
 cd $JPL_AIRS_REPO
 setsid nohup bash scripts/dlfront_jpl_chain.sh > logs/chain.out 2>&1 &
-tail -f logs/chain.out   # per-step logs land in logs/<phase-label>.log
+tail -f logs/chain.out   # per-step logs land in logs/dlfront/main/<run-ts>/<phase-label>.log
 ```
 
 `setsid` + `nohup` keeps the chain alive after logout; each step also gets
-its own log under `logs/`.
+its own log under the run's `logs/dlfront/main/<run-timestamp>/` directory
+(`logs/dlfront/main/latest/` always points at the newest run, and the same
+timestamp names the manifest `results/dl_front/chain_<ts>.txt`).
 
 ### Kriging validation (run during phase 1, read before stage B)
 
@@ -524,7 +526,10 @@ not be verified; it does not hard-fail the run.
 
 ```bash
 squeue -u $USER
-tail -f logs/dlfront_train_<jobid>.out
+# chain-submitted jobs log per run: <label>_<jobid>.out under the run dir
+tail -f logs/dlfront/main/latest/phase1-D6A-f0_<jobid>.out
+# (only a HAND-submitted `sbatch slurm/dlfront_train.sbatch ...` falls back
+#  to the .sbatch file's own logs/dlfront_train_<jobid>.out)
 tail -f $JPL_AIRS_RESULTS/dl_front/models/D6A-f0/history.csv
 # CPU-side CSI probe against a live run (works alongside GPU training):
 CUDA_VISIBLE_DEVICES="" PYTHONPATH=src python scripts/csi_probe.py \
