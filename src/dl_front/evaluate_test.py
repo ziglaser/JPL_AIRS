@@ -49,8 +49,12 @@ Outputs under ``results/dl_front/test_eval/`` (created on demand):
                                       (``kriged_channels``, see below), the
                                       LABEL digest (see below), git
                                       revision, timestamp
-* ``comparison.csv``                  (``compare`` subcommand) pooled CSI
-                                      pivoted (front, dilation_km) x leg
+* ``comparison.csv``                  (``compare`` subcommand) FOLD-POOLED
+                                      CSI pivoted (front, dilation_km) x
+                                      pooled leg -- the CV folds of one
+                                      stage x source collapse into one
+                                      column (user decision 2026-08-18;
+                                      see :func:`compare`)
 
 Label provenance (user decision 2026-08-18): the front labels were
 REGENERATED in place on 2026-08-17 (the antimeridian-crossing polyline bug
@@ -103,6 +107,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -808,13 +813,45 @@ def _check_same_sample(provenance: dict) -> bool:
     return False
 
 
+def pooled_leg_name(stem: str) -> tuple[str, int | None]:
+    """Leg stem -> (pooled name, fold number or None).
+
+    Fold pooling rule (user decision 2026-08-18): model legs are named
+    ``<stage>-f<k>_<source>`` (e.g. ``D6C-f0_kriged-airs``); the pooled name
+    strips the ``-f<k>`` (-> ``D6C_kriged-airs``).  A stem with no fold tag
+    (``bk19``) is its own one-member group and passes through unchanged.
+    """
+    m = re.fullmatch(r"(.+)-f(\d+)_(.+)", stem)
+    if m is None:
+        return stem, None
+    return f"{m.group(1)}_{m.group(3)}", int(m.group(2))
+
+
 def compare(out_dir: Path | None = None) -> pd.DataFrame:
-    """Pivot pooled CSI across every leg CSV -> comparison.csv + printed table.
+    """FOLD-POOLED CSI across every leg CSV -> comparison.csv + printed table.
 
     Dumb and robust by design: every ``*.csv`` in the eval dir carrying the
     frozen :data:`CSI_CSV_COLUMNS` is a leg named by its stem; anything else
     (including ``comparison.csv`` itself) is skipped with a note, and a leg
     missing a (front, dilation_km) row simply shows NaN there.
+
+    Fold pooling (user decision 2026-08-18, "remove non-final folds from
+    comparison.csv"): the CV folds of one stage x source
+    (``<stage>-f<k>_<source>``, see :func:`pooled_leg_name`) collapse into
+    ONE column named ``<stage>_<source>``.  The pool is the unweighted mean
+    across folds -- exact-weight, because every fold-leg scores the
+    IDENTICAL time steps (the same-sample guarantee this function enforces
+    via ``times_sha1``), so no fold carries more steps than another.  The
+    pooled ``_lo``/``_hi`` are the mean of the fold bounds -- an
+    APPROXIMATION of the pooled sampling CI (averaging bounds neither
+    narrows for the extra folds nor accounts for between-fold weight
+    variance), kept because the fold CIs are day-block bootstraps over the
+    same days and re-bootstrapping pooled counts here would need the raw
+    counts the leg CSVs deliberately do not carry.  Each pooled column gets
+    a ``<name>_n_folds`` companion so a 2-of-3-folds pool is visible in the
+    CSV itself, and a group with fewer members than its peers WARNS.  A
+    fold-tag-free leg (``bk19``) passes through unchanged, without
+    ``_n_folds``.
 
     One check IS performed: the same-sample guarantee, over BOTH digests in
     each leg's ``_run.json`` (see :func:`_check_same_sample`) --
@@ -823,10 +860,14 @@ def compare(out_dir: Path | None = None) -> pd.DataFrame:
     day files, a stale ``--no-match`` or partial ``--years`` run) and
     ``labels_sha1`` (the labels were regenerated in place on 2026-08-17
     WITHOUT moving the time axis, so a stale leg and a fresh one agree on
-    times_sha1 and would pool silently).  Either
-    disagreement is reported loudly here AND encoded in the output name
-    (the table is written as ``comparison_MISMATCHED_SAMPLE.csv``; the
-    warning tells you which leg to rerun and how).
+    times_sha1 and would pool silently).  The check runs across ALL legs at
+    once, which covers both within a pooled group and between groups.  Any
+    disagreement REFUSES to pool -- averaging folds scored on different
+    samples or labels would hide exactly the discrepancy the digests exist
+    to expose -- and instead writes the per-leg (unpooled) table under the
+    mismatch name, reported loudly AND encoded in the artifact
+    (``comparison_MISMATCHED_SAMPLE.csv``; the warning tells you which leg
+    to rerun and how).
     """
     out_dir = Path(out_dir) if out_dir is not None \
         else config.RESULTS_DIR / "test_eval"
@@ -838,10 +879,7 @@ def compare(out_dir: Path | None = None) -> pd.DataFrame:
         if not set(CSI_CSV_COLUMNS) <= set(df.columns):
             print(f"skipping {path.name}: not a CSI leg CSV", flush=True)
             continue
-        idx = df.set_index(["front", "km"])
-        legs[path.stem] = idx["csi"]
-        legs[f"{path.stem}_lo"] = idx["csi_lo"]
-        legs[f"{path.stem}_hi"] = idx["csi_hi"]
+        legs[path.stem] = df.set_index(["front", "km"])
         run_path = path.with_name(f"{path.stem}_run.json")
         try:
             provenance[path.stem] = json.loads(run_path.read_text())
@@ -851,7 +889,54 @@ def compare(out_dir: Path | None = None) -> pd.DataFrame:
         raise FileNotFoundError(f"no leg CSVs found in {out_dir}; run some "
                                 f"evaluations first")
     same_sample = _check_same_sample(provenance)
-    table = pd.DataFrame(legs)                # aligns on the index union
+
+    columns: dict = {}
+    if not same_sample:
+        # REFUSE to pool: a fold mean over mismatched samples/labels would
+        # bury the very discrepancy the digests flag.  The mismatch table
+        # stays per-leg so the odd column out is visible next to its peers.
+        print("\nNOT pooling folds: pooled means over mismatched samples "
+              "would hide the discrepancy above", flush=True)
+        for stem, idx in legs.items():
+            columns[stem] = idx["csi"]
+            columns[f"{stem}_lo"] = idx["csi_lo"]
+            columns[f"{stem}_hi"] = idx["csi_hi"]
+    else:
+        groups: dict[str, dict[int | None, pd.DataFrame]] = {}
+        for stem, idx in legs.items():
+            name, fold = pooled_leg_name(stem)
+            groups.setdefault(name, {})[fold] = idx
+        # a short-handed group (2 of 3 folds present) pools fine numerically
+        # but is NOT like-for-like against a full group, so it must not pass
+        # silently -- the n_folds column records it, this names it
+        fold_sizes = {name: len(members) for name, members in groups.items()
+                      if None not in members}      # fold-tagged groups only
+        if fold_sizes and len(set(fold_sizes.values())) > 1:
+            full = max(fold_sizes.values())
+            short = {n: k for n, k in sorted(fold_sizes.items()) if k < full}
+            print(f"\nWARNING: unequal fold counts across pooled legs -- "
+                  f"{short} vs {full} folds elsewhere; the short pools "
+                  f"average fewer checkpoints (check the *_n_folds columns "
+                  f"and rerun the missing fold evals)", flush=True)
+        for name, members in sorted(groups.items()):
+            folds = sorted(k for k in members if k is not None)
+            if folds:
+                print(f"pooled {name}: folds {folds}", flush=True)
+            # unweighted mean across folds is EXACT-weight here: the
+            # same-sample check above guarantees every member scored the
+            # identical steps.  The lo/hi mean is the documented CI
+            # approximation (see docstring).
+            columns[name] = pd.concat(
+                [m["csi"] for m in members.values()], axis=1).mean(axis=1)
+            columns[f"{name}_lo"] = pd.concat(
+                [m["csi_lo"] for m in members.values()], axis=1).mean(axis=1)
+            columns[f"{name}_hi"] = pd.concat(
+                [m["csi_hi"] for m in members.values()], axis=1).mean(axis=1)
+            if None not in members:            # bk19-style legs carry none
+                columns[f"{name}_n_folds"] = pd.Series(
+                    len(members), index=columns[name].index)
+
+    table = pd.DataFrame(columns)             # aligns on the index union
     table.index.names = ["front", "dilation_km"]
     # a non-like-for-like table must not masquerade as the headline result:
     # the stdout warning never reaches CSV consumers, so the mismatch is

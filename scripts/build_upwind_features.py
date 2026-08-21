@@ -10,6 +10,8 @@ src/trajectory_kernels/UPWIND_INDEX_REVIEW.md section 4.2:
                                   energy_fn=ClearSkyAvailableEnergy())
     sm_anom = SMAP_L4 surface SM (nearest analysis slot) - monthly baseline
     feats   = predictors.build_features(kernels, sm_anom, sm_raw, pbl)
+              + the kernel-derived QA diagnostics (upwind_dlat/dlon/km,
+                mean_lag_hours, psi_land, lag_weight -- add_kernel_diagnostics)
     write UPW_<YYYYMMDD>.nc (~kB-MB); DISCARD the kernels
 
 The dense kernels are ~0.6 GB per variable per day (~1 TB over the record) and
@@ -162,6 +164,60 @@ def select_smap_slot(fcst_dir: Path, day: Date, arrival_times: np.ndarray,
     return sm_raw.rename("sm_raw"), sm_anom, slot
 
 
+def add_kernel_diagnostics(feats: xr.Dataset, kernels: xr.Dataset,
+                           land_fn) -> xr.Dataset:
+    """Export the kernel-derived QA diagnostics before the kernels are discarded.
+
+    The physical-realism QA battery needs quantities that live in the dense
+    kernels themselves, which this script deliberately never persists (~0.6 GB
+    per variable per day, review F1). Everything the QA reads must therefore
+    be contracted down to the (arrival_step, target_lat, target_lon) table
+    HERE, at build time -- one extra contraction each, cheap next to the
+    footprint sweep. Added, all honesty-tier:
+
+        upwind_dlat/upwind_dlon/upwind_km/mean_lag_hours
+            the kernel geometry (``predictors.kernel_shape``): the influence
+            centroid must sit UPWIND of the receptor (QA check 2 dots it
+            against the low-level wind) and its age is the fetch clock.
+        psi_land
+            the kernel convolved with the SAME land fraction the footprint
+            build weighted by (``land.make_land_lookup(args.lsm)``): the
+            land-closure diagnostic of QA check 1. Interior receptors should
+            read ~1 (all influence mass over land); coastal/lake receptors
+            read < 1 in proportion to the over-water mass. ``min_coverage=0``
+            because the land field has no gaps -- a low value IS the signal,
+            never a sampling artefact to blank.
+        lag_weight  (on (arrival_step, target_lat, target_lon, lag))
+            the physical mass of each lag hour, copied verbatim so the QA can
+            inspect the hour-to-hour weighting; the yearly merge SKIPS it
+            (wrong dims for the (date, time, lat, lon) axes) and the QA reads
+            it from this daily file directly.
+    """
+    shape_ds = predictors.kernel_shape(kernels)
+    for name in shape_ds.data_vars:
+        feats[name] = shape_ds[name]
+
+    psi_land = predictors.psi(kernels, land_fn, min_coverage=0.0)
+    psi_land.name = "psi_land"
+    psi_land.attrs.update({
+        "units": "1",
+        "long_name": ("kernel-weighted land fraction of the source region "
+                      "(land-closure diagnostic: interior ~1, coastal < 1)"),
+    })
+    feats["psi_land"] = psi_land
+    feats["lag_weight"] = kernels["lag_weight"]
+
+    new_tiers = {name: "honesty" for name in
+                 ("upwind_dlat", "upwind_dlon", "upwind_km", "mean_lag_hours",
+                  "psi_land", "lag_weight")}
+    for name, tier in new_tiers.items():
+        feats[name].attrs["feature_tier"] = tier
+    existing = feats.attrs.get("feature_tiers", "")
+    addition = "; ".join(f"{k}={v}" for k, v in new_tiers.items())
+    feats.attrs["feature_tiers"] = f"{existing}; {addition}" if existing else addition
+    return feats
+
+
 def atomic_to_netcdf(ds: xr.Dataset, out_path: Path, encoding: dict | None = None) -> None:
     """Write ``ds`` to ``out_path`` atomically: tmp file in the same dir, then rename.
 
@@ -295,6 +351,9 @@ def main(argv=None) -> int:
     feats = predictors.build_features(
         kernels, sm_anom, sm_raw=sm_raw,
         pbl_model=None if args.uniform_energy else pbl)
+    # QA exports that live only in the dense kernels: contract them out NOW,
+    # before the kernels are discarded (they cannot be recovered later).
+    feats = add_kernel_diagnostics(feats, kernels, land_fn)
     del kernels  # ~0.6 GB/variable; the feature table is the product
 
     fractions = pbl.source_fractions

@@ -17,6 +17,9 @@ Two ingredient streams (UPWIND_INDEX_REVIEW.md section 4.2, merge step):
    1..6 = the fixed forecast valid times 21, 22, 23, 00, 01, 02 UTC (verified
    against ``FCST_parceltime``, 2019-06-05). Dates without a daily file stay
    NaN -- honest gaps, counted in the global attrs, never interpolated.
+   Daily-file variables on other dims (``lag_weight``, which carries an extra
+   ``lag`` axis) are skipped and their names recorded in the companion attr
+   ``daily_vars_skipped``; the QA battery reads them from the daily dir.
 
 2. **Trajectory-free features**, computed here because they need no kernel
    (review 1.8, F2): the PBL-top/free-convection race
@@ -86,6 +89,9 @@ FEATURE_TIERS: dict[str, str] = {
     "coverage": "honesty", "n_parcels": "honesty",
     "s_endpoint_anom": "honesty", "psi_meso_anom": "honesty",
     "containment_applied": "honesty",
+    "upwind_dlat": "honesty", "upwind_dlon": "honesty",
+    "upwind_km": "honesty", "mean_lag_hours": "honesty",
+    "psi_land": "honesty",
     "gamma_gap_mml": "core", "gamma_gap_mu": "core",
     "pblh_anom": "core", "pblh": "honesty",
     "omega_anom": "ablation",
@@ -119,23 +125,34 @@ def discover_daily_files(daily_dir: Path | None, dates: np.ndarray) -> dict:
 
 def load_daily_features(daily_files: dict, dates: np.ndarray,
                         lat: np.ndarray, lon: np.ndarray,
-                        n_slots: int) -> tuple[dict, dict]:
+                        n_slots: int) -> tuple[dict, dict, set]:
     """Assemble kernel-borne variables onto (date, time, lat, lon), NaN-padded.
 
     The daily contract: variables on ``(arrival_step, target_lat, target_lon)``
     with ``arrival_step`` values in 1..6, ``target_lat``/``target_lon`` equal to
-    the match-up grid. Arrival step ``s`` is inserted at ``time=s``; slot 0 (the
-    overpass -- no forward path, no kernel) is NaN by construction. The variable
-    union across files is taken, so a day built without a PBL model (no
-    omega/phi/m_star) simply leaves those slabs NaN for that date.
+    the match-up grid. EVERY variable on those dims is carried (the merge takes
+    the daily file's word for what a feature is); the variable union across
+    files is taken, so a day built without a PBL model (no omega/phi/m_star)
+    simply leaves those slabs NaN for that date. Arrival step ``s`` is inserted
+    at ``time=s``; slot 0 (the overpass -- no forward path, no kernel) is NaN
+    by construction.
+
+    Variables on OTHER dims are skipped gracefully and their names recorded:
+    ``lag_weight`` (on (arrival_step, target_lat, target_lon, lag)) is an
+    expected daily-file resident with no home on the (date, time, lat, lon)
+    axes -- the QA battery reads it from the daily dir directly. The skip is
+    silent (it happens for every file of the sweep) but never invisible: the
+    names land in the companion attr ``daily_vars_skipped``.
 
     Returns
     -------
     arrays : dict of str -> float32 ndarray (date, time, lat, lon)
     var_attrs : dict of str -> dict, attrs propagated from the daily files.
+    skipped : set of str, variable names left out for having other dims.
     """
     arrays: dict[str, np.ndarray] = {}
     var_attrs: dict[str, dict] = {}
+    skipped: set[str] = set()
     date_index = {d: i for i, d in enumerate(dates)}
     shape = (dates.size, n_slots, lat.size, lon.size)
 
@@ -151,7 +168,7 @@ def load_daily_features(daily_files: dict, dates: np.ndarray,
                                  f"FCST time axis 1..{n_slots - 1}")
             for name, da in ds.data_vars.items():
                 if set(da.dims) != {"arrival_step", "target_lat", "target_lon"}:
-                    warnings.warn(f"{path}: skipping {name} with dims {da.dims}")
+                    skipped.add(name)
                     continue
                 if name not in arrays:
                     arrays[name] = np.full(shape, np.nan, dtype=np.float32)
@@ -159,7 +176,7 @@ def load_daily_features(daily_files: dict, dates: np.ndarray,
                 vals = da.transpose("arrival_step", "target_lat",
                                     "target_lon").values.astype(np.float32)
                 arrays[name][date_index[d], steps] = vals
-    return arrays, var_attrs
+    return arrays, var_attrs, skipped
 
 
 # --------------------------------------------------------------------------- #
@@ -278,7 +295,7 @@ def build_companion(fcst: xr.Dataset, daily_files: dict,
     lon = fcst["lon"].values
     n_slots = fcst.sizes["time"]
 
-    kernel_arrays, kernel_attrs = load_daily_features(
+    kernel_arrays, kernel_attrs, skipped = load_daily_features(
         daily_files, dates, lat, lon, n_slots)
     times = slot_datetimes(fcst)
     free_arrays, free_attrs, notes = trajectory_free_features(
@@ -302,6 +319,7 @@ def build_companion(fcst: xr.Dataset, daily_files: dict,
         "n_dates": n_days,
         "n_dates_with_daily_file": len(daily_files),
         "daily_coverage_fraction": round(len(daily_files) / n_days, 4),
+        "daily_vars_skipped": ", ".join(sorted(skipped)) if skipped else "(none)",
         "nan_policy": "gaps are NaN and counted here, never interpolated or "
                       "filled from climatology (an anomaly of climatology from "
                       "climatology is identically 0 -- fabricated certainty)",

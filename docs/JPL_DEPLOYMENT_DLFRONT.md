@@ -474,6 +474,11 @@ to the machine with the `/mnt/d` mount, not the cluster).
    setsid nohup bash scripts/dlfront_full_sequence.sh > logs/full_sequence.log 2>&1 &
    ```
    See its header for the timeout/poll knobs.
+9. **Analysis-only alternative** (no training, no krige builds): when every
+   checkpoint and cache is already final and only the numbers/figures need
+   refreshing against the labels now on disk, `scripts/dlfront_analysis.sh`
+   reruns all evals, the fold-pooled compare, the permutation tables, and
+   every figure in one pass — see section 12.
 
 **If the labels are ever lost and must be regenerated from the raw XML**
 (this is a from-scratch rebuild, not what step 1 above needs — only run it
@@ -729,3 +734,62 @@ Caveat: the exported prediction domain (`analysis_domain()`, land ≥ 0.5) is
 *smaller* than the FCST grid, so `pred_front_*` is NaN outside it (~lat
 31.5-52.5) while the met-drawn flags cover every cell — never compare the two
 without masking to `pred_front_valid_frac > 0`.
+
+## 12. Analysis-only reruns
+
+`scripts/dlfront_analysis.sh` (new 2026-08-20) reruns **every analysis
+against the artifacts already on disk** — it never trains, never builds a
+krige cache, and never builds the swath bank. Use it when the checkpoints
+and caches are done and you only need the downstream numbers and figures
+refreshed: after a label regeneration (this is the analysis-side companion
+to section 6's `FORCE_EVAL=1` re-score, but it also refreshes the
+permutation tables and every figure in the same pass), after pulling a
+finished cluster run to another box, or after an eval-core change
+invalidated the CSVs.
+
+What it runs, in dependency order (see `--help` for the full contract):
+
+1. **Pre-flight + discovery.** Aborts loudly unless the kriged-airs cache
+   exists with a readable schema for every `EVAL_YEARS` year *and* at least
+   one finished checkpoint (`<name>_final.h5`) sits under
+   `$JPL_AIRS_RESULTS/dl_front/models` — with nothing trained there is
+   nothing to analyze, and this script will not train it. It then
+   **discovers** every finished checkpoint on disk and splits them into
+   main-curriculum stems (`D6A/D6B/D6C-f<k>`) and everything else (the
+   `D6A5/D6A3/D6A2` ladder rungs, one-offs). Discovery is disk-driven, not
+   `FOLDS`-driven: whatever finished training gets analyzed.
+2. **Eval legs + compare.** Every main checkpoint × `{reanalysis,
+   kriged-airs}` through `dl_front.evaluate_test`, plus the checkpoint-free
+   BK19 leg, plus the final fold-pooled `compare` into `comparison.csv` —
+   all with the main chain's skip discipline (years/match_source/
+   `labels_sha1`/`ckpt_sha1`). Non-main checkpoints are evaluated too (no
+   `--channels` flag needed: `evaluate_test` adopts each checkpoint's own
+   `run_config.yaml` channel list) and their CSVs are moved into
+   `ablation_eval/` exactly like the ablation chain's move step, so a
+   reduced-channel rung can never contaminate `comparison.csv`; the compare
+   job waits on those moves.
+3. **Permutation importance.** Every discovered checkpoint (main *and*
+   non-main) × both sources through `dl_front.permutation --repeats
+   $PERM_REPEATS`, with the ablation chain's skip discipline
+   (`labels_sha1` + `ckpt_sha1`). Ladder stems land in the same
+   `permutation/` directory under their naturally distinct names.
+4. **Six-panel figures** for each fold in `FOLDS` (non-fatal).
+5. **`scripts/plot_dlfront_results.py`** (`--all-folds`, non-fatal), so the
+   summary figure set is refreshed in the same pass.
+
+Knobs mirror the sibling chains (`JPL_AIRS_*`, `CLASSES`, `FOLDS` —
+six-panel only, `EVAL_YEARS` default 2016-2018, `PERM_REPEATS`, `FORCE=1`,
+`DRY_RUN=1`, `SBATCH_*`). With SLURM it submits a dependency chain; without
+it, the same steps run sequentially in the foreground:
+
+```bash
+DRY_RUN=1 bash scripts/dlfront_analysis.sh   # inspect the plan first
+bash scripts/dlfront_analysis.sh             # run it
+FORCE=1 bash scripts/dlfront_analysis.sh     # rerun every leg regardless
+```
+
+Like the sibling chains it duplicates their helpers rather than sourcing
+them (independent editability), stamps a manifest at
+`results/dl_front/analysis_<timestamp>.txt`, and degrades gracefully (loud
+warning, existence-only staleness checks) when the submitting shell cannot
+compute the label digest.

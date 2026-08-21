@@ -182,16 +182,32 @@ def load_trajectories(day: pd.Timestamp):
     return None
 
 
-def merra2_point(day: pd.Timestamp, lat: float, lon: float):
-    """Concatenated MERRA-2 compact profiles for the day and the next (or None)."""
-    parts = []
+def merra2_point(day: pd.Timestamp, lat: float, lon: float,
+                 dense_dir: Path | None = None):
+    """MERRA-2 point profiles for the day and the next (or None).
+
+    Prefers the DENSE case-study files (``m2_dense_point_<YYYYMMDD>.nc4``,
+    42-level M2I3NPASM subsets pulled from the cloud OPeNDAP endpoint) when
+    present in ``dense_dir``; otherwise falls back to the compact front-id
+    corpus (5 levels). Both are 3-hourly -- the densest cadence MERRA-2
+    provides for profiles.
+    """
+    parts, dense = [], False
     for d in (day, day + pd.Timedelta(days=1)):
+        dense_path = (dense_dir / f"m2_dense_point_{d:%Y%m%d}.nc4"
+                      if dense_dir else None)
+        if dense_path is not None and dense_path.exists():
+            with xr.open_dataset(dense_path) as ds:
+                parts.append(ds.squeeze(["lat", "lon"]).load())
+            dense = True
+            continue
         path = MERRA2_DAILY / f"{d:%Y}" / f"m2_{d:%Y%m%d}.nc"
         if path.exists():
             with xr.open_dataset(path) as ds:
                 parts.append(ds.sel(lat=lat, lon=lon, method="nearest").load())
     if not parts:
         return None
+    print(f"      MERRA-2 source: {'dense 42-level point subsets' if dense else 'compact 5-level corpus'}")
     m2 = xr.concat(parts, dim="time")
     # corrupt-transfer guard (QV identically 0 in some daily files): mask
     n_zero = int((m2["QV"].values == 0).sum())
@@ -202,19 +218,17 @@ def merra2_point(day: pd.Timestamp, lat: float, lon: float):
     return m2
 
 
-#: dataset level markers drawn on each Skew-T:
-#: table row -> (color, linestyle, label x-position in axes fraction)
+#: dataset level markers drawn on each Skew-T (MU parcel heights + PBLH only;
+#: MML dropped per Zach 2026-08-20): row -> (color, linestyle, label x-frac)
 LEVEL_MARKERS = {
     "MU LCL [m]":  ("tab:orange", "-", 0.02),
-    "MML LCL [m]": ("tab:orange", ":", 0.24),
-    "MU LFC [m]":  ("tab:purple", "-", 0.48),
-    "MML LFC [m]": ("tab:purple", ":", 0.72),
+    "MU LFC [m]":  ("tab:purple", "-", 0.38),
     "MU EL [m]":   ("tab:brown", "-", 0.02),
-    "PBL depth (Guo 3-hrly, nearest) [m]": ("tab:blue", "-", 0.72),
+    "PBL depth (Guo 3-hrly, nearest) [m]": ("tab:blue", "-", 0.70),
 }
 
 
-def _add_level_markers(skew, col: pd.Series, p_of_z) -> None:
+def _add_level_markers(skew, col: pd.Series, p_of_z, fontsize=7.5) -> None:
     """Horizontal lines at the dataset's LCL/LFC/EL/PBLH for one forecast hour.
 
     Heights are AGL (the AIRS-FCST datum was verified AGL, and the Guo PBLH is
@@ -233,108 +247,233 @@ def _add_level_markers(skew, col: pd.Series, p_of_z) -> None:
         skew.ax.axhline(p, color=color, ls=ls, lw=1.4, alpha=0.85)
         short = row.split(" [")[0].replace("PBL depth (Guo 3-hrly, nearest)",
                                            "PBLH")
-        skew.ax.text(x0, p, f"{short} {z:.0f}m", color=color, fontsize=6.5,
+        skew.ax.text(x0, p, f"{short} {z:.0f}m", color=color,
+                     fontsize=fontsize,
                      va="bottom", ha="left", clip_on=True,
                      transform=skew.ax.get_yaxis_transform(),
                      bbox=dict(fc="white", ec="none", alpha=0.6, pad=0.5))
 
 
+def _cell_parcels(traj, step: int, cell, mpcalc, units):
+    """HYSPLIT parcels inside the cell at one step, sorted by pressure."""
+    at = traj.isel(step=step)
+    lat, lon = cell
+    inside = ((np.abs(at["lat"] - lat) <= 0.5)
+              & (np.abs(at["lon"] - lon) <= 0.5)).values
+    if not inside.any():
+        return None
+    p = at["pres"].values[inside]
+    t = at["t"].values[inside] - 273.15
+    q = at["q"].values[inside]
+    z = at["alt"].values[inside]
+    ok = np.isfinite(p) & np.isfinite(t) & np.isfinite(q) & np.isfinite(z)
+    p, t, q, z = p[ok], t[ok], q[ok], z[ok]
+    order = np.argsort(p)
+    p, t, q, z = p[order], t[order], q[order], z[order]
+    td = mpcalc.dewpoint_from_specific_humidity(
+        p * units.hPa, (q / 1000.0) * units("kg/kg")).magnitude
+    zo = np.argsort(z)
+    time = pd.Timestamp(np.nanmin(at["time_utc"].values[inside]))
+    return dict(p=p, t=t, td=td, z=z, n=int(inside.sum()), time=time,
+                p_of_z=lambda h, zz=z[zo], pp=p[zo]: float(np.interp(h, zz, pp)))
+
+
+def _parcel_analysis(p, t, td, mpcalc, units):
+    """Most-unstable parcel path + CAPE/CIN integrated from a sounding.
+
+    Input arrays are surface-first (descending pressure). Returns None when
+    the profile is too short/broken for metpy's parcel routines.
+    """
+    try:
+        P = np.asarray(p, dtype=float) * units.hPa
+        T = np.asarray(t, dtype=float) * units.degC
+        D = np.asarray(td, dtype=float) * units.degC
+        cape, cin = mpcalc.most_unstable_cape_cin(P, T, D)
+        _, _, _, idx = mpcalc.most_unstable_parcel(P, T, D)
+        prof = mpcalc.parcel_profile(P[idx:], T[idx], D[idx]).to("degC")
+        return dict(p=P[idx:], env_t=T[idx:], prof=prof,
+                    cape=float(cape.magnitude), cin=float(cin.magnitude))
+    except Exception as err:
+        print(f"      parcel analysis skipped ({err})")
+        return None
+
+
+def _binned_median(p, x, bin_hpa: float):
+    bins = np.arange(100, 1055, bin_hpa)
+    idx = np.digitize(p, bins)
+    pm, xm = [], []
+    for b in np.unique(idx):
+        sel = idx == b
+        if sel.sum() >= 3:
+            pm.append(np.median(p[sel]))
+            xm.append(np.median(x[sel]))
+    return pm, xm
+
+
+def _draw_panel(skew, parc, m2near, col, mpcalc, units,
+                ylim, xlim, bin_hpa, label_fs, legend=False, pa=None):
+    """One Skew-T panel: parcels, MERRA-2 profile, CAPE/CIN, level markers."""
+    if pa is not None:  # MU parcel path + shaded CAPE (red) / CIN (blue)
+        skew.plot(pa["p"], pa["prof"], "k-", lw=1.6, alpha=0.9,
+                  label="MU parcel path")
+        skew.shade_cape(pa["p"], pa["env_t"], pa["prof"], alpha=0.18)
+        skew.shade_cin(pa["p"], pa["env_t"], pa["prof"], alpha=0.22)
+    if parc is not None:
+        skew.plot(parc["p"], parc["t"], "r.", ms=3.5, alpha=0.35)
+        skew.plot(parc["p"], parc["td"], "g.", ms=3.5, alpha=0.35)
+        pm, tm = _binned_median(parc["p"], parc["t"], bin_hpa)
+        _, dm = _binned_median(parc["p"], parc["td"], bin_hpa)
+        skew.plot(pm, tm, "r-", lw=2, label=f"HYSPLIT T (n={parc['n']})")
+        skew.plot(pm, dm, "g-", lw=2, label="HYSPLIT Td")
+    if m2near is not None:
+        pl = m2near["lev"].values
+        tt = m2near["T"].values - 273.15
+        td = mpcalc.dewpoint_from_specific_humidity(
+            pl * units.hPa, m2near["QV"].values * units("kg/kg")).magnitude
+        fin = np.isfinite(tt)  # 1000 hPa is below ground here -> NaN
+        if fin.sum() > 10:  # dense subset: profile lines
+            skew.plot(pl[fin], tt[fin], color="darkred", ls="--", lw=1.6,
+                      label="MERRA-2 T (42-lev)")
+            fin_d = fin & np.isfinite(td)
+            skew.plot(pl[fin_d], td[fin_d], color="darkgreen", ls="--",
+                      lw=1.6, label="MERRA-2 Td (42-lev)")
+        else:  # compact corpus: 5-level anchor circles
+            skew.plot(pl, tt, "ro", mfc="none", ms=9, mew=2, label="MERRA-2 T")
+            skew.plot(pl, td, "go", mfc="none", ms=9, mew=2, label="MERRA-2 Td")
+        bsel = fin & (pl >= ylim[1]) & (pl <= ylim[0])
+        skew.plot_barbs(pl[bsel], m2near["U"].values[bsel],
+                        m2near["V"].values[bsel])
+    p_of_z = (parc["p_of_z"] if parc is not None
+              else (lambda z: 1013.25 * np.exp(-z / 8400.0)))
+    _add_level_markers(skew, col, p_of_z, fontsize=label_fs)
+    skew.ax.set_ylim(*ylim)
+    skew.ax.set_xlim(*xlim)
+    skew.plot_dry_adiabats(alpha=0.15)
+    skew.plot_moist_adiabats(alpha=0.15)
+    skew.plot_mixing_lines(alpha=0.15)
+    if legend:
+        skew.ax.legend(fontsize=8, loc="upper left")
+
+
 def plot_skewts(out: Path, day: pd.Timestamp, point: tuple[float, float],
-                cell: tuple[float, float], traj, m2, table: pd.DataFrame) -> Path:
-    """One Skew-T per forecast hour: HYSPLIT parcels in-cell + MERRA-2 anchor."""
+                cell: tuple[float, float], traj, m2,
+                table: pd.DataFrame) -> list[Path]:
+    """One figure PER forecast hour: full Skew-T (to 200 hPa) + BL zoom panel.
+
+    The boundary layer cannot be "stretched" on a Skew-T without breaking the
+    45-degree isotherm geometry, so the accepted practice is a companion
+    zoomed panel: right subplot repeats the sounding over 1050-750 hPa with
+    finer parcel binning, where the PBL/LCL/LFC structure is actually legible.
+    """
     import metpy.calc as mpcalc
     from metpy.plots import SkewT
     from metpy.units import units
 
     lat, lon = cell
-    steps = list(range(7))
-    fig = plt.figure(figsize=(24, 11))
-    for i, step in enumerate(steps):
-        skew = SkewT(fig, rotation=45, subplot=(2, 4, i + 1))
-        title = None
-        # height-AGL -> pressure fallback (scale height); replaced by the
-        # parcels' own alt/pres relation when in-cell parcels exist
-        p_of_z = lambda z: 1013.25 * np.exp(-z / 8400.0)  # noqa: E731
+    paths = []
+    for step in range(7):
+        parc = (_cell_parcels(traj, step, cell, mpcalc, units)
+                if traj is not None else None)
+        panel_time = (parc["time"] if parc is not None else
+                      slot_datetimes(day, (0,) + tuple(
+                          cs_config.FORECAST_SLOTS))[step])
+        m2near = (m2.sel(time=panel_time, method="nearest")
+                  if m2 is not None else None)
 
-        if traj is not None:
-            at = traj.isel(step=step)
-            inside = ((np.abs(at["lat"] - lat) <= 0.5)
-                      & (np.abs(at["lon"] - lon) <= 0.5)).values
-            n_in = int(inside.sum())
-            if n_in:
-                p = at["pres"].values[inside]
-                t = at["t"].values[inside] - 273.15
-                q = at["q"].values[inside]
-                z = at["alt"].values[inside]
-                ok = (np.isfinite(p) & np.isfinite(t) & np.isfinite(q)
-                      & np.isfinite(z))
-                p, t, q, z = p[ok], t[ok], q[ok], z[ok]
-                order = np.argsort(p)
-                p, t, q, z = p[order], t[order], q[order], z[order]
-                zo = np.argsort(z)
-                p_of_z = lambda h, zz=z[zo], pp=p[zo]: (  # noqa: E731
-                    float(np.interp(h, zz, pp)))
-                td = mpcalc.dewpoint_from_specific_humidity(
-                    p * units.hPa, (q / 1000.0) * units("kg/kg")).magnitude
-                skew.plot(p, t, "r.", ms=3, alpha=0.35)
-                skew.plot(p, td, "g.", ms=3, alpha=0.35)
-                # median profile in 25-hPa bins (readable line over the cloud)
-                bins = np.arange(100, 1050, 25)
-                idx = np.digitize(p, bins)
-                pm, tm, dm = [], [], []
-                for b in np.unique(idx):
-                    sel = idx == b
-                    if sel.sum() >= 3:
-                        pm.append(np.median(p[sel]))
-                        tm.append(np.median(t[sel]))
-                        dm.append(np.median(td[sel]))
-                skew.plot(pm, tm, "r-", lw=2, label=f"HYSPLIT T (n={n_in})")
-                skew.plot(pm, dm, "g-", lw=2, label="HYSPLIT Td")
-                utc = pd.Timestamp(np.nanmin(at["time_utc"].values[inside]))
-                title = f"step {step}: {utc:%H:%M}Z {utc:%b-%d}"
+        # BL-zoom x-range from the data actually below 750 hPa
+        lo_t = [v for src in (
+            (parc["t"][parc["p"] >= 750], parc["td"][parc["p"] >= 750])
+            if parc is not None else ()) for v in src]
+        if m2near is not None:
+            pl = m2near["lev"].values
+            lo_t += list(m2near["T"].values[(pl >= 750) & (pl <= 1000)] - 273.15)
+        lo_t = np.asarray([v for v in lo_t if np.isfinite(v)])
+        zoom_xlim = ((float(lo_t.min()) - 2, float(lo_t.max()) + 4)
+                     if lo_t.size else (0, 35))
 
-        if m2 is not None:
-            panel_time = None
-            if traj is not None:
-                ts = pd.Series(pd.to_datetime(
-                    traj["time_utc"].isel(step=step).values.ravel())).dropna()
-                panel_time = ts.median() if len(ts) else None
-            if panel_time is None or pd.isna(panel_time):
-                panel_time = slot_datetimes(day, (0,) + tuple(
-                    cs_config.FORECAST_SLOTS))[step]
-            near = m2.sel(time=panel_time, method="nearest")
-            pl = near["lev"].values
-            tt = near["T"].values - 273.15
+        # CAPE/CIN integrations: one from the HYSPLIT binned-median
+        # sounding, one from the dense MERRA-2 profile (each shades its own
+        # panel)
+        pa_hy = None
+        if parc is not None:
+            pm, tm = _binned_median(parc["p"], parc["t"], 10)
+            _, dm = _binned_median(parc["p"], parc["td"], 10)
+            pa_hy = _parcel_analysis(pm[::-1], tm[::-1], dm[::-1], mpcalc,
+                                     units)
+        pa_m2 = None
+        if m2near is not None:
+            pl = m2near["lev"].values
+            tt = m2near["T"].values - 273.15
             td = mpcalc.dewpoint_from_specific_humidity(
-                pl * units.hPa, near["QV"].values * units("kg/kg")).magnitude
-            skew.plot(pl, tt, "ro", mfc="none", ms=9, mew=2,
-                      label="MERRA-2 T")
-            skew.plot(pl, td, "go", mfc="none", ms=9, mew=2,
-                      label="MERRA-2 Td")
-            skew.plot_barbs(pl, near["U"].values, near["V"].values)
-            if title is None:
-                title = (f"step {step}: "
-                         f"{pd.Timestamp(near['time'].item()):%H:%M}Z (M2)")
+                pl * units.hPa, m2near["QV"].values * units("kg/kg")).magnitude
+            fin = np.isfinite(tt) & np.isfinite(td) & (pl >= 100)
+            pa_m2 = _parcel_analysis(pl[fin], tt[fin], td[fin], mpcalc, units)
 
-        _add_level_markers(skew, table.iloc[:, i], p_of_z)
-        skew.ax.set_ylim(1050, 100)
-        skew.ax.set_xlim(-40, 45)
-        skew.plot_dry_adiabats(alpha=0.15)
-        skew.plot_moist_adiabats(alpha=0.15)
-        skew.plot_mixing_lines(alpha=0.15)
-        skew.ax.set_title(title or f"step {step}", fontsize=11)
-        if i == 0:
-            skew.ax.legend(fontsize=8, loc="upper left")
-    fig.suptitle(
-        f"Skew-T log-P by forecast hour, {day:%Y-%m-%d} -- cell "
-        f"{lat:g}N {abs(lon):g}W (requested {point[0]:g}, {point[1]:g}); "
-        "dots = advected AIRS/HYSPLIT parcels in-cell, circles = MERRA-2 "
-        "(5 levels, nearest 3-hourly time)", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    path = out / f"skewt_{day:%Y%m%d}_{lat:g}N_{abs(lon):g}W.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return path
+        # layout: left column = HYSPLIT full skew-T over a half-height BL
+        # zoom; right column (full height) = the MERRA-2 skew-T, side by side
+        import matplotlib.gridspec as mgridspec
+        fig = plt.figure(figsize=(15, 10))
+        gs = mgridspec.GridSpec(2, 2, figure=fig, height_ratios=[2, 1],
+                                hspace=0.18, wspace=0.16)
+        col = table.iloc[:, step]
+
+        skew_full = SkewT(fig, rotation=45, subplot=gs[0, 0])
+        _draw_panel(skew_full, parc, None, col, mpcalc, units,
+                    ylim=(1050, 200), xlim=(-30, 45), bin_hpa=25,
+                    label_fs=7.5, legend=True, pa=pa_hy)
+        skew_full.ax.set_title("HYSPLIT/AIRS advected sounding (to 200 hPa)",
+                               fontsize=11)
+        note = [f"dataset MU CAPE {col.get('MU CAPE [J/kg]', np.nan):.0f} / "
+                f"CIN {col.get('MU CIN [J/kg]', np.nan):.0f} J/kg"]
+        if pa_hy is not None:
+            note.insert(0, f"profile MU CAPE {pa_hy['cape']:.0f} / "
+                           f"CIN {pa_hy['cin']:.0f} J/kg (shaded)")
+        skew_full.ax.text(0.02, 0.02, "\n".join(note), fontsize=8.5,
+                          transform=skew_full.ax.transAxes, va="bottom",
+                          bbox=dict(fc="white", ec="0.6", alpha=0.85))
+
+        # BL zoom drawn UNSKEWED (rotation=0, emagram-style): metpy's 45-deg
+        # shear is an axes-space transform, so a stretched shallow layer
+        # cannot keep the skew geometry; unskewed, temperature reads straight
+        # off the x-axis and the fine BL structure fills the panel.
+        skew_zoom = SkewT(fig, rotation=0, subplot=gs[1, 0], aspect="auto")
+        _draw_panel(skew_zoom, parc, None, col, mpcalc, units,
+                    ylim=(1050, 750), xlim=zoom_xlim, bin_hpa=10,
+                    label_fs=9, pa=pa_hy)
+        skew_zoom.ax.set_title("boundary layer zoom (1050-750 hPa, unskewed)",
+                               fontsize=11)
+
+        skew_m2 = SkewT(fig, rotation=45, subplot=gs[:, 1])
+        _draw_panel(skew_m2, None, m2near, col, mpcalc, units,
+                    ylim=(1050, 200), xlim=(-30, 45), bin_hpa=25,
+                    label_fs=7.5, legend=True, pa=pa_m2)
+        m2_when = (f"{pd.Timestamp(m2near['time'].item()):%H:%M}Z"
+                   if m2near is not None else "n/a")
+        skew_m2.ax.set_title(f"MERRA-2 sounding ({m2_when}, 42-lev)",
+                             fontsize=11)
+        if pa_m2 is not None:
+            skew_m2.ax.text(0.02, 0.02,
+                            f"MERRA-2 MU CAPE {pa_m2['cape']:.0f} / "
+                            f"CIN {pa_m2['cin']:.0f} J/kg (shaded)",
+                            fontsize=8.5, transform=skew_m2.ax.transAxes,
+                            va="bottom",
+                            bbox=dict(fc="white", ec="0.6", alpha=0.85))
+
+        when = (f"{parc['time']:%H:%M}Z {parc['time']:%b-%d}" if parc is not None
+                else f"{panel_time:%H:%M}Z {panel_time:%b-%d}")
+        fig.suptitle(
+            f"Skew-T log-P, step {step} ({when}) -- cell {lat:g}N "
+            f"{abs(lon):g}W; left = HYSPLIT/AIRS parcels + BL zoom, right = MERRA-2;"
+            " lines = dataset MU LCL/LFC/EL + Guo PBLH; shading = "
+            "profile-integrated MU CAPE (red) / CIN (blue)", fontsize=12.5)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        tag = "ovp" if step == 0 else f"{panel_time:%H}Z"
+        path = out / (f"skewt_{day:%Y%m%d}_{lat:g}N_{abs(lon):g}W_"
+                      f"s{step}_{tag}.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(path)
+    return paths
 
 
 # --------------------------------------------------------------------------- #
@@ -360,15 +499,15 @@ def main(argv=None) -> None:
     traj = load_trajectories(day)
     if traj is None:
         print("      no trajectory files for this date -> HYSPLIT panels skipped")
-    m2 = merra2_point(day, args.point[0], args.point[1])
+    m2 = merra2_point(day, args.point[0], args.point[1], dense_dir=out)
     if m2 is None:
         print("      no MERRA-2 daily files found -> MERRA-2 overlay skipped")
 
     print("[3/3] Skew-T panels + report ...")
-    fig_path = None
+    fig_paths = []
     if traj is not None or m2 is not None:
-        fig_path = plot_skewts(out, day, tuple(args.point), cell, traj, m2,
-                               table)
+        fig_paths = plot_skewts(out, day, tuple(args.point), cell, traj, m2,
+                                table)
 
     fmt = lambda v: "-" if not np.isfinite(v) else f"{v:.3g}"
     lines = [f"# Daily cell report: {day:%Y-%m-%d}, "
@@ -389,8 +528,10 @@ def main(argv=None) -> None:
               "|---" * (len(l4.columns) + 1) + "|"]
     for name, r in l4.iterrows():
         lines.append(f"| {name} | " + " | ".join(fmt(v) for v in r) + " |")
-    if fig_path is not None:
-        lines += ["", f"Skew-T panels: `{fig_path.name}`"]
+    if fig_paths:
+        lines += ["", "Skew-T figures (one per forecast hour, full column + "
+                  "boundary-layer zoom):"]
+        lines += [f"- `{p.name}`" for p in fig_paths]
     (out / "REPORT.md").write_text("\n".join(lines) + "\n")
     print(f"done -> {out}/")
 

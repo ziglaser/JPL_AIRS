@@ -328,6 +328,8 @@ def leg_csv(out_dir, stem, rows):
 
 
 def test_compare_pivots_legs(tmp_path):
+    """Fold-pooled schema: -f<k> legs collapse to <stage>_<source> columns
+    (with an _n_folds companion), bk19 passes through unchanged."""
     leg_csv(tmp_path, "D6C-f0_kriged-airs",
             [("cold", 0, 0.0, 0.30), ("cold", 1, 111.0, 0.50),
              ("dryline", 1, 111.0, 0.10)])
@@ -339,19 +341,83 @@ def test_compare_pivots_legs(tmp_path):
 
     table = evaluate_test.compare(out_dir=tmp_path)
     assert list(table.columns) == [
-        "D6C-f0_kriged-airs", "D6C-f0_kriged-airs_lo", "D6C-f0_kriged-airs_hi",
-        "bk19", "bk19_lo", "bk19_hi"]
+        "D6C_kriged-airs", "D6C_kriged-airs_lo", "D6C_kriged-airs_hi",
+        "D6C_kriged-airs_n_folds", "bk19", "bk19_lo", "bk19_hi"]
     assert table.index.names == ["front", "dilation_km"]
     assert table.loc[("cold", 111.0), "bk19"] == 0.40
-    assert table.loc[("cold", 111.0), "D6C-f0_kriged-airs"] == 0.50
+    assert table.loc[("cold", 111.0), "D6C_kriged-airs"] == 0.50
+    assert table.loc[("cold", 111.0), "D6C_kriged-airs_n_folds"] == 1
     assert np.isnan(table.loc[("dryline", 111.0), "bk19"])   # missing leg row
 
     saved = pd.read_csv(tmp_path / "comparison.csv")
-    assert {"front", "dilation_km", "D6C-f0_kriged-airs", "bk19",
+    assert {"front", "dilation_km", "D6C_kriged-airs", "bk19",
             "bk19_lo", "bk19_hi"} <= set(saved.columns)
     # rerunning must not pick up comparison.csv itself as a leg
     table2 = evaluate_test.compare(out_dir=tmp_path)
     assert list(table2.columns) == list(table.columns)
+
+
+def test_compare_pools_folds(tmp_path, capsys):
+    """Two same-sample folds of one stage x source pool to ONE column: csi
+    (and the CI bounds) are the unweighted fold mean, n_folds records the
+    membership (fold pooling rule, user decision 2026-08-18)."""
+    pd.DataFrame([{"front": "cold", "dilation": 1, "km": 111.0,
+                   "csi": 0.40, "csi_lo": 0.30, "csi_hi": 0.50,
+                   "pod": 0.5, "far": 0.1, "fb": 1.0}]).to_csv(
+        tmp_path / "D6C-f0_kriged-airs.csv", index=False)
+    pd.DataFrame([{"front": "cold", "dilation": 1, "km": 111.0,
+                   "csi": 0.60, "csi_lo": 0.40, "csi_hi": 0.80,
+                   "pod": 0.7, "far": 0.2, "fb": 1.1}]).to_csv(
+        tmp_path / "D6C-f1_kriged-airs.csv", index=False)
+    run_json(tmp_path, "D6C-f0_kriged-airs", "a" * 40)
+    run_json(tmp_path, "D6C-f1_kriged-airs", "a" * 40)
+
+    table = evaluate_test.compare(out_dir=tmp_path)
+    assert list(table.columns) == [
+        "D6C_kriged-airs", "D6C_kriged-airs_lo", "D6C_kriged-airs_hi",
+        "D6C_kriged-airs_n_folds"]
+    row = table.loc[("cold", 111.0)]
+    assert row["D6C_kriged-airs"] == pytest.approx(0.50)      # mean(.40,.60)
+    assert row["D6C_kriged-airs_lo"] == pytest.approx(0.35)   # mean of bounds
+    assert row["D6C_kriged-airs_hi"] == pytest.approx(0.65)
+    assert row["D6C_kriged-airs_n_folds"] == 2
+    out = capsys.readouterr().out
+    assert "pooled D6C_kriged-airs: folds [0, 1]" in out
+    assert (tmp_path / "comparison.csv").exists()
+
+
+def test_compare_warns_on_uneven_fold_groups(tmp_path, capsys):
+    """A group missing a fold (2-of-3 pool) pools but WARNS and shows the
+    shortfall in its _n_folds column."""
+    rows = [("cold", 1, 111.0, 0.40)]
+    for stem in ("D6B-f0_kriged-airs", "D6B-f1_kriged-airs",
+                 "D6C-f0_kriged-airs"):
+        leg_csv(tmp_path, stem, rows)
+        run_json(tmp_path, stem, "a" * 40)
+
+    table = evaluate_test.compare(out_dir=tmp_path)
+    assert table.loc[("cold", 111.0), "D6B_kriged-airs_n_folds"] == 2
+    assert table.loc[("cold", 111.0), "D6C_kriged-airs_n_folds"] == 1
+    assert "WARNING: unequal fold counts" in capsys.readouterr().out
+
+
+def test_compare_refuses_to_pool_mismatched_folds(tmp_path, capsys):
+    """Folds of one group with DIFFERENT times_sha1 must not be averaged:
+    the table stays per-leg and lands in comparison_MISMATCHED_SAMPLE.csv."""
+    rows = [("cold", 1, 111.0, 0.40)]
+    leg_csv(tmp_path, "D6C-f0_kriged-airs", rows)
+    leg_csv(tmp_path, "D6C-f1_kriged-airs", rows)
+    run_json(tmp_path, "D6C-f0_kriged-airs", "a" * 40)
+    run_json(tmp_path, "D6C-f1_kriged-airs", "b" * 40)   # different sample
+
+    table = evaluate_test.compare(out_dir=tmp_path)
+    assert "D6C-f0_kriged-airs" in table.columns         # unpooled columns
+    assert "D6C-f1_kriged-airs" in table.columns
+    assert "D6C_kriged-airs" not in table.columns
+    out = capsys.readouterr().out
+    assert "NOT pooling folds" in out
+    assert (tmp_path / "comparison_MISMATCHED_SAMPLE.csv").exists()
+    assert not (tmp_path / "comparison.csv").exists()
 
 
 def test_compare_empty_dir_raises(tmp_path):

@@ -278,6 +278,63 @@ def test_endpoint_value_reads_the_receptor_cell(kernel_ds):
 
 
 # ---------------------------------------------------------------------------
+# (6b) kernel_shape: centroid offset, fetch distance, influence age
+# ---------------------------------------------------------------------------
+def test_kernel_shape_centroid_at_known_offset_cell():
+    """Mass concentrated at known cells: lag 0 is a delta on the receptor's own
+    cell (offset 0,0) with lag_weight 3, lag 1 a delta one cell west (dlon=-1)
+    with lag_weight 1. The lag_weight x kernel centroid is therefore
+    (0, (3*0 + 1*(-1))/4) = (0, -0.25) deg, the fetch is the haversine length
+    of that offset at the receptor latitude, and the influence age is the
+    3:1-weighted mean lag (3*0 + 1*1)/4 = 0.25 h."""
+    from trajectory_kernels import geo
+
+    ds = _lag_split_kernel_ds()
+    out = P.kernel_shape(ds)
+    assert set(out.data_vars) == {"upwind_dlat", "upwind_dlon", "upwind_km",
+                                  "mean_lag_hours"}
+    for name in out.data_vars:
+        assert out[name].dims == ("arrival_step", "target_lat", "target_lon")
+    assert np.allclose(out["upwind_dlat"].values, 0.0, atol=1e-12)
+    assert np.allclose(out["upwind_dlon"].values, -0.25, atol=1e-12)
+    assert np.allclose(out["mean_lag_hours"].values, 0.25, atol=1e-12)
+    expected_km = geo.haversine_km(40.5, -90.5, 40.5, -90.75)
+    assert np.allclose(out["upwind_km"].values, expected_km, atol=1e-9)
+    assert expected_km == pytest.approx(21.1, abs=0.5)  # 0.25 deg lon at 40.5 N
+
+
+def test_kernel_shape_symmetric_kernel_centroid_is_the_receptor(kernel_ds):
+    """A uniform kernel over a symmetric window has its centroid ON the
+    receptor: zero offset, zero fetch; equal lag weights -> mean lag 0.5 h."""
+    out = P.kernel_shape(kernel_ds)
+    assert np.allclose(out["upwind_dlat"].values, 0.0, atol=1e-12)
+    assert np.allclose(out["upwind_dlon"].values, 0.0, atol=1e-12)
+    assert np.allclose(out["upwind_km"].values, 0.0, atol=1e-6)
+    assert np.allclose(out["mean_lag_hours"].values, 0.5, atol=1e-12)
+
+
+def test_kernel_shape_nan_where_nothing_arrived(kernel_ds):
+    """Receptors with n_parcels == 0 (or zero total weight) have no geometry
+    to report: every kernel_shape variable is NaN there, finite elsewhere."""
+    ds = kernel_ds.copy(deep=True)
+    ds["n_parcels"].values[:, 0, 1] = 0
+    out = P.kernel_shape(ds)
+    for name in out.data_vars:
+        assert np.isnan(out[name].sel(target_lon=-89.5).values).all(), name
+        assert np.isfinite(out[name].sel(target_lon=-90.5).values).all(), name
+
+
+def test_kernel_shape_falls_back_to_equal_lag_weights_with_warning():
+    """Kernels predating lag_weight get the equal-per-populated-lag fallback
+    (same contract as psi): the 3:1 centroid becomes the 1:1 one."""
+    ds = _lag_split_kernel_ds().drop_vars("lag_weight")
+    with pytest.warns(UserWarning, match="lag_weight"):
+        out = P.kernel_shape(ds)
+    assert np.allclose(out["upwind_dlon"].values, -0.5, atol=1e-12)
+    assert np.allclose(out["mean_lag_hours"].values, 0.5, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
 # (7) build_features assembly and tier bookkeeping
 # ---------------------------------------------------------------------------
 def test_build_features_tiers_dims_and_optional_columns(kernel_ds):

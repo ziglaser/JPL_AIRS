@@ -7,6 +7,10 @@
 #           main chain: swath bank -> krige builds -> D6A/B/C x 3 folds ->
 #           evals -> compare), then WAIT until every fold's three stage
 #           checkpoints and the kriged-airs caches exist.
+#   (then)  dl_front.six_panel qualitative figures for SIXPANEL_FOLDS
+#           (default fold 0) -- non-fatal, like the chain's quicklooks: it
+#           needs checkpoints + kriged-airs + bk19 together, which first
+#           exists at this point in the sequence.
 #   Step 5  scripts/dlfront_ablation_chain.sh (permutation importance on the
 #           NEW checkpoints + the D6A5/D6A3/D6A2 channel ladder).  Submitted
 #           as soon as the main chain's trainings are done; it runs
@@ -41,6 +45,8 @@
 # Idempotent: every phase it drives is itself idempotent (done-markers with
 # labels_sha1/ckpt_sha1 staleness checks), so rerunning this script after a
 # partial failure resumes where it stopped instead of redoing finished work.
+# (Analysis-only reruns against ALREADY-finished artifacts -- no training,
+# no krige builds -- are scripts/dlfront_analysis.sh, runbook section 12.)
 #
 # Env knobs (all optional):
 #   POLL_SECS            poll interval while waiting          (default 300)
@@ -158,6 +164,20 @@ for ((y = Y0; y <= Y1; y++)); do
 done
 wait_for "step4 main chain (9 checkpoints + kriged-airs $EXPORT_YEARS)" \
          "$MAIN_TIMEOUT_H" "${MAIN_JIDS:-}" "${MAIN_TARGETS[@]}"
+
+# ---- six-panel qualitative figures (non-fatal, like the chain quicklooks) - #
+# dl_front.six_panel is not part of any chain: it needs the finished D6A/D6C
+# checkpoints AND the kriged-airs cache AND the bk19 archive at once, which
+# only exists here, after the step-4 wait.  A figure failure must never block
+# the ablation/export/inject pipeline -- render, note, move on.  Foreground:
+# a handful of instants through a small CNN is minutes on CPU.
+SIXPANEL_FOLDS=${SIXPANEL_FOLDS:-0}
+for k in $SIXPANEL_FOLDS; do
+    log "six-panel figures, fold $k (non-fatal)"
+    python -m dl_front.six_panel --fold "$k" \
+        > "logs/full_sequence_six_panel_f$k.log" 2>&1 \
+        || log "six_panel fold $k FAILED (non-fatal, see the log)"
+done
 
 # ---- step 5: ablation chain (runs concurrently with 6-7) ------------------ #
 log "step 5: ablation chain (permutation on the new checkpoints + channel ladder)"

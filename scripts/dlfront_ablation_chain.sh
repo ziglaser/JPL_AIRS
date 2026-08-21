@@ -56,6 +56,21 @@
 #           ablation eval CSVs are written to a SEPARATE results directory
 #           (ABLATION_EVAL_DIR below) so they cannot leak into the main
 #           chain's three-way comparison.csv -- see the note there.
+#           After each rung's training, step 3 ALSO runs step-2-style
+#           permutation importance (dl_front.permutation, --repeats
+#           $PERM_REPEATS) on the rung checkpoint itself, x {reanalysis,
+#           kriged-airs} (user request 2026-08-20): the ladder says how
+#           much skill a channel SET retains, the permutation says which
+#           channel WITHIN each rung the retrained weights actually lean
+#           on -- e.g. whether D6A3's gap over D6A2 really flows through
+#           SLP.  Same readiness gate as step 2 (<ckpt>_final.h5; in the
+#           SLURM branch the permutation job is instead afterok on the
+#           rung's train job, so a fresh rung permutes in the same
+#           submission), same done-marker discipline, and the CSVs land in
+#           the SAME permutation/ directory as step 2's -- the rung stems
+#           (D6A5-f<k>_<source> etc.) are naturally distinct from the
+#           main-chain stems, and comparison.csv never globs that
+#           directory.
 #           REQUIRES the kriged-airs cache (see the pre-flight check
 #           below).
 #
@@ -155,6 +170,12 @@
 #     NOT the main chain's test_eval/, so these reduced-channel legs can
 #     never be pivoted into comparison.csv as if they were peers of
 #     D6A/B/C).
+#   step 3 permutation done-marker: EXACTLY step 2's (skip_perm: CSV in
+#     permutation/ + labels_sha1 + ckpt_sha1) -- the ckpt_sha1 half is
+#     what makes a rung retrain (FORCE=1, or a deleted _final.h5)
+#     automatically invalidate that rung's permutation CSVs without
+#     invalidating anyone else's.  The rung stems never collide with
+#     step 2's (D6A5-f<k> vs D6A-f<k>).
 # FORCE=1 overrides both.
 #
 # Results layout (coordinate with the eval-core owner if this changes):
@@ -686,6 +707,39 @@ if [ "$HAVE_SLURM" = 1 ]; then
                     # not executed yet.
                     submit_move "step3-move-$stem" "$SUBMIT_JID" "$stem"
                 done
+
+                # permutation importance on the rung checkpoint itself
+                # (user request 2026-08-20, see the step-3 header note):
+                # which channel WITHIN this rung do the retrained weights
+                # lean on.  afterok on this rung's train job (when one was
+                # submitted) plays the role of step 2's _final.h5 readiness
+                # gate: a fresh rung permutes in the same submission, and a
+                # failed/cancelled train leaves the permutation job held,
+                # never permuting a half-trained snapshot.  With no train
+                # job (skip_train), ${ckpt}_final.h5 already exists, which
+                # IS step 2's gate.  Same skip_perm done-marker as step 2 --
+                # its ckpt_sha1 check also correctly forces a rerun here
+                # whenever a train job was just submitted (the weights on
+                # disk are about to be superseded).
+                for src in reanalysis kriged-airs; do
+                    stem=${ckpt}_${src}
+                    if skip_perm "$stem" "$MODELS/$ckpt/$ckpt.h5"; then
+                        note "skip step3 perm $stem (matched CSV exists;" \
+                             "FORCE=1 to rerun)"
+                        continue
+                    fi
+                    # --channels is belt-and-braces exactly as on the eval
+                    # legs above: permutation.resolve_channels would adopt
+                    # the checkpoint's run_config.yaml anyway, but a
+                    # missing/mis-written yaml must fail loudly, not score
+                    # a mismatched model.
+                    submit "step3-perm-$stem" 1 "$JTRAIN" \
+                           slurm/dlfront_permutation.sbatch \
+                           --ckpt "$MODELS/$ckpt/$ckpt.h5" \
+                           --classes "$CLASSES" --source "$src" \
+                           --years "$EVAL_YEARS" --repeats "$PERM_REPEATS" \
+                           --channels "$chans"
+                done
             done
         done
     fi
@@ -760,6 +814,36 @@ else
                     # eval itself, so there is nothing to move; guard on it
                     # the same way run_local guards the eval command.
                     [ "$DRY_RUN" != 1 ] && move_to_ablation_dir "$stem"
+                done
+                # permutation importance on the rung checkpoint itself --
+                # same ${ckpt}_final.h5 readiness gate as step 2 (see the
+                # comment there): the train above just (re)wrote it, so a
+                # missing _final.h5 here means that training failed or was
+                # interrupted, and permuting the leftover best-val snapshot
+                # would write a complete, provenance-stamped CSV whose
+                # done-marker hides the failure from every later run.
+                # DRY_RUN bypasses the gate: it previews the plan a real
+                # run WOULD execute, and in a real run the train above has
+                # produced _final.h5 by this point -- same reasoning that
+                # lets DRY_RUN through the kriged-cache pre-flight.
+                if [ "$DRY_RUN" != 1 ] \
+                   && [ ! -e "$MODELS/$ckpt/${ckpt}_final.h5" ]; then
+                    note "step3 skip perm $ckpt: no ${ckpt}_final.h5 at" \
+                         "$MODELS/$ckpt/ (this rung's training failed or" \
+                         "was interrupted above)"
+                    continue
+                fi
+                for src in reanalysis kriged-airs; do
+                    stem=${ckpt}_${src}
+                    if skip_perm "$stem" "$MODELS/$ckpt/$ckpt.h5"; then
+                        note "skip step3 perm $stem (matched CSV exists)"
+                        continue
+                    fi
+                    # --channels: same belt-and-braces as the eval legs
+                    run_local "step3-perm-$stem" dl_front.permutation \
+                        --ckpt "$MODELS/$ckpt/$ckpt.h5" --classes "$CLASSES" \
+                        --source "$src" --years "$EVAL_YEARS" \
+                        --repeats "$PERM_REPEATS" --channels "$chans"
                 done
             done
         done

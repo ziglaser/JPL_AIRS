@@ -80,7 +80,7 @@ import warnings
 import numpy as np
 import xarray as xr
 
-from . import config
+from . import config, geo
 from .apply import apply_kernel
 from .pbl import PBLModel
 
@@ -377,6 +377,109 @@ def psi_mesoscale(kernel_ds: xr.Dataset, surface, smooth_deg: float = 3.0,
     out.attrs["long_name"] = (
         f"mesoscale component of the direction index (S minus {smooth_deg} deg mean)")
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Kernel geometry: where the influence sits and how old it is (QA diagnostics)
+# --------------------------------------------------------------------------- #
+def kernel_shape(kernel_ds: xr.Dataset) -> xr.Dataset:
+    """Geometry of the influence kernel, on (arrival_step, target_lat, target_lon).
+
+    Purely kernel-derived (no surface field enters), so these must be exported
+    by the per-day builder BEFORE the kernels are discarded -- they cannot be
+    recovered from the feature table afterwards. Variables:
+
+        upwind_dlat, upwind_dlon [deg]  the influence-centroid offset from the
+                                        receptor: the weighted mean of the
+                                        relative ``dlat``/``dlon`` coordinates
+                                        under w = lag_weight * kernel over
+                                        (lag, dlat, dlon). The kernel is
+                                        normalized PER LAG, so ``lag_weight``
+                                        restores the physical hour-to-hour
+                                        mass -- exactly the weighting ``psi``
+                                        applies to the soil field (review 1.6).
+        upwind_km                [km]   haversine length of that centroid
+                                        offset evaluated at the receptor
+                                        latitude (``geo.haversine_km``): the
+                                        effective fetch of the source region.
+        mean_lag_hours           [h]    the lag_weight-weighted mean lag: the
+                                        age of the influence reaching the
+                                        receptor (HANDOFF 7.7 -- nearly free
+                                        once the kernels exist; here it is).
+
+    Physics the QA battery checks against (UPWIND_INDEX_REVIEW.md QA check 2):
+    the air arrives FROM upwind, so the centroid must sit on the upstream side
+    of the receptor -- dotting (upwind_dlon, upwind_dlat) against the day's
+    low-level wind vector should give a NEGATIVE (upstream) projection over
+    almost all receptors; a positive projection means the trajectory clock or
+    the offset sign convention is broken. Consistency scales: with ~10 m/s
+    low-level flow and mean_lag_hours ~ 3 h, upwind_km should sit near
+    100 km -- upwind_km >> wind x lag flags a kernel/geometry bug.
+
+    NaN policy: every variable is NaN where ``n_parcels == 0`` or the total
+    kernel weight is zero (nothing arrived -- there is no geometry to report).
+    Kernels predating ``lag_weight`` fall back (with the same warning as
+    ``psi``) to equal weight per populated lag.
+    """
+    kernel = np.nan_to_num(
+        kernel_ds["kernel"].transpose("arrival_step", "target_lat", "target_lon",
+                                      "lag", "dlat", "dlon").values.astype(float),
+        nan=0.0)  # (step, tlat, tlon, lag, dlat, dlon)
+    if "lag_weight" in kernel_ds:
+        lw = np.nan_to_num(
+            kernel_ds["lag_weight"].transpose(
+                "arrival_step", "target_lat", "target_lon", "lag"
+            ).values.astype(float), nan=0.0)
+    else:
+        warnings.warn(
+            "kernel dataset has no 'lag_weight' variable (built before the "
+            "hour-to-hour weighting fix): kernel_shape falls back to equal "
+            "weight per populated lag. Rebuild the kernels to restore the "
+            "energy weighting.", stacklevel=2)
+        lw = (kernel.sum(axis=(-2, -1)) > 0).astype(float)
+
+    dlat = kernel_ds["dlat"].values.astype(float)
+    dlon = kernel_ds["dlon"].values.astype(float)
+    lag = kernel_ds["lag"].values.astype(float)
+
+    w = kernel * lw[..., None, None]           # physical mass per source cell
+    total = w.sum(axis=(3, 4, 5))              # (step, tlat, tlon)
+    lag_total = lw.sum(axis=3)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cen_dlat = (w * dlat[None, None, None, None, :, None]).sum(axis=(3, 4, 5)) / total
+        cen_dlon = (w * dlon[None, None, None, None, None, :]).sum(axis=(3, 4, 5)) / total
+        mean_lag = (lw * lag[None, None, None, :]).sum(axis=3) / lag_total
+
+    tlat = kernel_ds["target_lat"].values.astype(float)
+    tlon = kernel_ds["target_lon"].values.astype(float)
+    grid_lat, grid_lon = np.meshgrid(tlat, tlon, indexing="ij")
+    km = geo.haversine_km(grid_lat, grid_lon,
+                          grid_lat + cen_dlat, grid_lon + cen_dlon)
+
+    valid = (kernel_ds["n_parcels"].values > 0) & (total > 0) & (lag_total > 0)
+    coords = {"arrival_step": kernel_ds["arrival_step"],
+              "target_lat": tlat, "target_lon": tlon}
+    dims = ("arrival_step", "target_lat", "target_lon")
+
+    def _da(vals, name, units, long_name):
+        return xr.DataArray(np.where(valid, vals, np.nan), dims=dims,
+                            coords=coords, name=name,
+                            attrs={"units": units, "long_name": long_name})
+
+    return xr.Dataset({
+        "upwind_dlat": _da(cen_dlat, "upwind_dlat", "degrees",
+                           "influence-centroid latitude offset from the "
+                           "receptor (lag_weight x kernel weighted)"),
+        "upwind_dlon": _da(cen_dlon, "upwind_dlon", "degrees",
+                           "influence-centroid longitude offset from the "
+                           "receptor (lag_weight x kernel weighted)"),
+        "upwind_km": _da(km, "upwind_km", "km",
+                         "haversine length of the influence-centroid offset "
+                         "at the receptor latitude (effective fetch)"),
+        "mean_lag_hours": _da(mean_lag, "mean_lag_hours", "h",
+                              "lag_weight-weighted mean lag: age of the "
+                              "influence reaching the receptor"),
+    })
 
 
 # --------------------------------------------------------------------------- #

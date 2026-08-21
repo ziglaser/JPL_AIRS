@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parents[1]
 MAIN_CHAIN = REPO / "scripts/dlfront_jpl_chain.sh"
 ABLATION_CHAIN = REPO / "scripts/dlfront_ablation_chain.sh"
 FULL_SEQUENCE = REPO / "scripts/dlfront_full_sequence.sh"
+ANALYSIS_CHAIN = REPO / "scripts/dlfront_analysis.sh"
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None,
                                 reason="no bash on this machine")
@@ -38,7 +39,9 @@ def _help(script: Path) -> str:
     return out.stdout
 
 
-@pytest.mark.parametrize("script", [MAIN_CHAIN, ABLATION_CHAIN, FULL_SEQUENCE],
+@pytest.mark.parametrize("script",
+                         [MAIN_CHAIN, ABLATION_CHAIN, FULL_SEQUENCE,
+                          ANALYSIS_CHAIN],
                          ids=lambda p: p.name)
 def test_chain_script_parses(script):
     """``bash -n``: no syntax errors.  A chain that dies on load at 02:00
@@ -49,7 +52,8 @@ def test_chain_script_parses(script):
     assert out.returncode == 0, out.stderr
 
 
-@pytest.mark.parametrize("script", [MAIN_CHAIN, ABLATION_CHAIN],
+@pytest.mark.parametrize("script", [MAIN_CHAIN, ABLATION_CHAIN,
+                                    ANALYSIS_CHAIN],
                          ids=lambda p: p.name)
 def test_help_is_the_header_comment(script):
     """``--help`` prints the header block: the scripts' only documentation.

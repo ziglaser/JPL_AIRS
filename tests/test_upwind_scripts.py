@@ -414,14 +414,24 @@ def merge_world(tmp_path_factory):
     )
     fcst.to_netcdf(fcst_dir / "FCST_SMAP_MRMS_2019.nc")
 
-    # --- one daily kernel file for the in-record date only, steps 1 and 4
+    # --- one daily kernel file for the in-record date only, steps 1 and 4.
+    # Carries the kernel-derived QA diagnostics of the daily contract too:
+    # upwind_km / psi_land on the mergeable dims, and lag_weight on its extra
+    # lag axis -- which the merge must SKIP (and record), never crash on.
     psi = np.arange(8, dtype=np.float32).reshape(2, 2, 2)
     daily = xr.Dataset(
         {"psi_anom": (("arrival_step", "target_lat", "target_lon"), psi),
          "coverage": (("arrival_step", "target_lat", "target_lon"),
-                      np.full((2, 2, 2), 0.5, dtype=np.float32))},
+                      np.full((2, 2, 2), 0.5, dtype=np.float32)),
+         "upwind_km": (("arrival_step", "target_lat", "target_lon"),
+                       np.full((2, 2, 2), 120.0, dtype=np.float32)),
+         "psi_land": (("arrival_step", "target_lat", "target_lon"),
+                      np.full((2, 2, 2), 1.0, dtype=np.float32)),
+         "lag_weight": (("arrival_step", "target_lat", "target_lon", "lag"),
+                        np.ones((2, 2, 2, 3), dtype=np.float32))},
         coords={"arrival_step": np.array([1, 4]),
-                "target_lat": _MERGE_LAT, "target_lon": _MERGE_LON},
+                "target_lat": _MERGE_LAT, "target_lon": _MERGE_LON,
+                "lag": np.array([0.0, 1.0, 2.0])},
     )
     daily.to_netcdf(daily_dir / "UPW_20190605.nc")
 
@@ -534,6 +544,22 @@ def test_merge_tier_attrs_present(merged):
     assert "nan_policy" in ds.attrs
 
 
+def test_merge_carries_diagnostics_and_skips_lag_weight(merged):
+    """The merge carries EVERY (arrival_step, target_lat, target_lon) variable
+    it finds (the QA diagnostics ride along with no code change), and skips
+    lag_weight -- whose extra lag axis has no home on (date, time, lat, lon) --
+    gracefully, recording the name in attrs. The QA reads lag_weight from the
+    daily dir directly."""
+    ds, _ = merged
+    assert np.allclose(ds["UPW_upwind_km"].values[0, [1, 4]], 120.0)
+    assert np.isnan(ds["UPW_upwind_km"].values[0, 0]).all()   # slot 0: no kernel
+    assert np.allclose(ds["UPW_psi_land"].values[0, [1, 4]], 1.0)
+    assert ds["UPW_upwind_km"].attrs["feature_tier"] == "honesty"
+    assert ds["UPW_psi_land"].attrs["feature_tier"] == "honesty"
+    assert "UPW_lag_weight" not in ds.data_vars
+    assert ds.attrs["daily_vars_skipped"] == "lag_weight"
+
+
 def test_merge_daily_dir_default_matches_builder_out_dir(merge_world, upw_mod):
     """The merge's --daily-dir default and the builder's --out-dir default are
     the SAME path, so the handoff cannot silently miss (a None default used to
@@ -561,6 +587,7 @@ def test_merge_no_daily_is_explicit_trajectory_free(merge_world, recwarn):
         assert "UPW_pblh" in ds.data_vars                 # trajectory-free stream intact
         assert ds.attrs["daily_files_found"] == 0
         assert ds.attrs["daily_dir"] == "(none: --no-daily)"
+        assert ds.attrs["daily_vars_skipped"] == "(none)"
 
 
 def test_merge_empty_daily_dir_warns_loudly(merge_world):
@@ -768,15 +795,39 @@ def test_main_refuses_analytic_pblh_fallback(upw_mod, tmp_path, synthetic_day_di
     assert "upwind_pblh_3hrly.sbatch" in msg
 
 
+def _tiny_kernel_ds() -> xr.Dataset:
+    """A REAL (if tiny) kernel dataset in the build_all layout, on the fixture
+    grid: 2 steps x 2x2 receptors x 2 lags x 3x3 window, uniform kernel and
+    equal lag weights -- so the real kernel_shape/psi diagnostics run in main
+    and their symmetric-kernel values (centroid 0, mean lag 0.5) are known."""
+    drel = np.array([-1.0, 0.0, 1.0])
+    lag = np.array([0.0, 1.0])
+    shape = (2, _MERGE_LAT.size, _MERGE_LON.size, lag.size, drel.size, drel.size)
+    return xr.Dataset(
+        {"kernel": (("arrival_step", "target_lat", "target_lon",
+                     "lag", "dlat", "dlon"), np.full(shape, 1.0 / 9.0)),
+         "footprint": (("arrival_step", "target_lat", "target_lon",
+                        "lag", "dlat", "dlon"), np.full(shape, 0.5)),
+         "lag_weight": (("arrival_step", "target_lat", "target_lon", "lag"),
+                        np.full(shape[:4], 4.5, dtype="float32")),
+         "n_parcels": (("arrival_step", "target_lat", "target_lon"),
+                       np.full(shape[:3], 25))},
+        coords={"arrival_step": np.array([1, 2]), "target_lat": _MERGE_LAT,
+                "target_lon": _MERGE_LON, "lag": lag, "dlat": drel, "dlon": drel},
+        attrs={"energy_model": "ClearSkyAvailableEnergy",
+               "arrival_times_utc": ["2019-06-05T21:00", "2019-06-05T23:00"]},
+    )
+
+
 def _stub_heavy_stages(upw_mod, monkeypatch):
-    """Replace the footprint sweep and predictor stage with tiny fakes so main
-    can run end-to-end in milliseconds; everything upstream (arg handling,
-    preflight, PBL guard, SMAP slot selection, attrs, atomic write) stays real."""
-    fake_kernels = xr.Dataset()
-    fake_kernels.attrs["arrival_times_utc"] = ["2019-06-05T21:00", "2019-06-05T23:00"]
+    """Replace the footprint sweep and the build_features stage with tiny fakes
+    so main can run end-to-end in milliseconds; everything else (arg handling,
+    preflight, PBL guard, SMAP slot selection, the kernel QA diagnostics --
+    which run for REAL on the tiny kernels -- attrs, atomic write) stays real.
+    The stub land lookup is all-land (constant 1), so psi_land must read 1."""
 
     def fake_build_all(day_ds, **kwargs):
-        return fake_kernels
+        return _tiny_kernel_ds()
 
     def fake_build_features(kernels, sm_anom, sm_raw=None, pbl_model=None):
         shp = (_MERGE_LAT.size, _MERGE_LON.size)
@@ -788,7 +839,9 @@ def _stub_heavy_stages(upw_mod, monkeypatch):
 
     monkeypatch.setattr(upw_mod.footprint, "build_all", fake_build_all)
     monkeypatch.setattr(upw_mod.predictors, "build_features", fake_build_features)
-    monkeypatch.setattr(upw_mod.land, "make_land_lookup", lambda path: None)
+    monkeypatch.setattr(
+        upw_mod.land, "make_land_lookup",
+        lambda path: (lambda glat, glon: np.ones(np.shape(glat))))
 
 
 def test_main_allow_pblh_fallback_escape(upw_mod, tmp_path, synthetic_day_dir,
@@ -819,6 +872,34 @@ def test_main_production_run_not_stamped_fallback(upw_mod, tmp_path,
     with xr.open_dataset(tmp_path / "daily_out" / "UPW_20190605.nc") as ds:
         assert "pblh_fallback" not in ds.attrs
         assert ds.attrs["pblh_source_fractions"].startswith("assessed=")
+
+
+def test_main_exports_kernel_diagnostics(upw_mod, tmp_path, synthetic_day_dir,
+                                         monkeypatch):
+    """The daily file carries the kernel-derived QA exports (they die with the
+    discarded kernels otherwise): kernel_shape's geometry, psi_land, and the
+    raw lag_weight, all honesty-tier. On the stub's uniform symmetric kernel
+    the geometry is exactly known: centroid on the receptor (offset and fetch
+    0), mean lag 0.5 h; the all-land stub lookup closes psi_land at 1."""
+    _stub_heavy_stages(upw_mod, monkeypatch)
+    args = _builder_world(tmp_path, synthetic_day_dir, with_pblh=True)
+    assert upw_mod.main(args) == 0
+    with xr.open_dataset(tmp_path / "daily_out" / "UPW_20190605.nc") as ds:
+        for name in ("upwind_dlat", "upwind_dlon", "upwind_km",
+                     "mean_lag_hours", "psi_land"):
+            assert ds[name].dims == ("arrival_step", "target_lat", "target_lon")
+            assert ds[name].attrs["feature_tier"] == "honesty", name
+        assert np.allclose(ds["upwind_dlat"].values, 0.0, atol=1e-9)
+        assert np.allclose(ds["upwind_dlon"].values, 0.0, atol=1e-9)
+        assert np.allclose(ds["upwind_km"].values, 0.0, atol=1e-6)
+        assert np.allclose(ds["mean_lag_hours"].values, 0.5)
+        assert np.allclose(ds["psi_land"].values, 1.0)
+        assert ds["lag_weight"].dims == ("arrival_step", "target_lat",
+                                         "target_lon", "lag")
+        assert np.allclose(ds["lag_weight"].values, 4.5)
+        assert ds["lag_weight"].attrs["feature_tier"] == "honesty"
+        assert "psi_land=honesty" in ds.attrs["feature_tiers"]
+        assert "upwind_km=honesty" in ds.attrs["feature_tiers"]
 
 
 @pytest.mark.skip(reason="full build_upwind_features driver needs a real HYSPLIT "
