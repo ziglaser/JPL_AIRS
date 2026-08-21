@@ -81,6 +81,11 @@ def main(argv=None) -> None:
                     metavar=("DLAT", "DLON"), help="map half-extents (deg)")
     ap.add_argument("--out", type=Path,
                     default=cs_config.RESULTS_DIR / "daily_reports")
+    ap.add_argument("--single", type=float, default=None, metavar="HOURS",
+                    help="ALSO write a standalone two-panel (T | q) figure "
+                         "for the analysis time this many hours after the "
+                         "date's 00Z (e.g. 24 = 00Z next day); colorbars and "
+                         "lat/lon labels, no titles")
     args = ap.parse_args(argv)
     day = pd.Timestamp(args.date)
     plat, plon = args.point
@@ -103,6 +108,14 @@ def main(argv=None) -> None:
         print(f"WARNING: {n_zero} QV==0 samples masked as missing "
               "(corrupt daily file -- consider re-downloading that day)")
         m2["QV"] = m2["QV"].where(m2["QV"] > 0)
+    # sea-level pressure from the surface corpus (contours on both rows)
+    slp_files = [MERRA2_DAILY.parent / "sfc_daily" / f"{d:%Y}" /
+                 f"m2sfc_{d:%Y%m%d}.nc"
+                 for d in (day, day + pd.Timedelta(days=1))]
+    slp = None
+    if all(f.exists() for f in slp_files):
+        slp = xr.concat([xr.open_dataset(f) for f in slp_files],
+                        dim="time")["SLP"].sel(**box) / 100.0  # Pa -> hPa
     fronts = {w: open_year(day.year, w) for w in ("1wide", "3wide")}
     if fronts["1wide"] is None:
         raise SystemExit(f"no CODSUS front file for {day.year}")
@@ -126,54 +139,66 @@ def main(argv=None) -> None:
     except Exception:
         have_cartopy = False
 
-    fig = plt.figure(figsize=(4.2 * len(times), 7.6))
+    FIELDS = [("T", "RdYlBu_r", "925-hPa T (degC)", 1.0),
+              ("QV", "YlGnBu", "925-hPa q (g/kg)", 1000.0)]
     extent = (plon - dlon, plon + dlon, plat - dlat, plat + dlat)
-    tvals = m2["T"].sel(**{}) - 273.15
+    tvals = m2["T"] - 273.15
     tmin, tmax = float(tvals.quantile(0.01)), float(tvals.quantile(0.99))
+
+    def draw_panel(fig, rect, t, field, cmap, unit, scale):
+        """One map panel: shaded field + barbs + SLP contours + fronts + star."""
+        if have_cartopy:
+            ax = make_conus_axes(fig=fig, rect=rect, extent=extent)
+            tr = dict(transform=ccrs.PlateCarree())
+        else:
+            ax = fig.add_subplot(*rect)
+            ax.set_xlim(extent[:2]), ax.set_ylim(extent[2:])
+            tr = {}
+        snap = m2.sel(time=t, method="nearest")
+        fld = (snap[field] - 273.15) if field == "T" else snap[field] * scale
+        mesh = ax.pcolormesh(
+            snap["lon"], snap["lat"], fld, cmap=cmap, zorder=3,
+            vmin=tmin if field == "T" else 4,
+            vmax=tmax if field == "T" else 20, alpha=0.8, **tr)
+        step = 2  # barb thinning
+        blon, blat = np.meshgrid(snap["lon"].values[::step],
+                                 snap["lat"].values[::step])
+        ax.barbs(blon, blat, snap["U"].values[::step, ::step],
+                 snap["V"].values[::step, ::step],
+                 length=4.5, linewidth=0.6, zorder=4, **tr)
+        if slp is not None:
+            ps = slp.sel(time=t, method="nearest")
+            cs = ax.contour(ps["lon"].values, ps["lat"].values, ps.values,
+                            levels=np.arange(960, 1048, 2), colors="k",
+                            linewidths=0.7, alpha=0.8, zorder=4.5, **tr)
+            ax.clabel(cs, fontsize=7, fmt="%d")
+        fr = fronts["1wide"]["fronts"].sel(time=t, method="nearest").sel(**box)
+        for i, ftype in enumerate(
+                str(x) for x in fronts["1wide"]["front_type"].values):
+            if ftype not in FRONT_COLORS:
+                continue
+            yy, xx = np.where(fr.isel(front=i).values > 0)
+            if yy.size:
+                ax.plot(fr["lon"].values[xx], fr["lat"].values[yy], "s",
+                        ms=7, mec="k", mew=0.4, color=FRONT_COLORS[ftype],
+                        zorder=5, **tr)
+        ax.plot(plon, plat, marker="*", ms=16, mec="k", mfc="cyan",
+                zorder=6, **tr)
+        return ax, mesh
+
+    # ---- multi-time overview figure ----------------------------------------
+    fig = plt.figure(figsize=(4.2 * len(times), 7.6))
     meshes = []
-    for row, (field, cmap, unit, scale) in enumerate(
-            [("T", "RdYlBu_r", "925-hPa T (degC)", 1.0),
-             ("QV", "YlGnBu", "925-hPa q (g/kg)", 1000.0)]):
-        for col, t in enumerate(times):
-            idx = row * len(times) + col + 1
-            if have_cartopy:
-                ax = make_conus_axes(fig=fig, rect=(2, len(times), idx),
-                                     extent=extent)
-                tr = dict(transform=ccrs.PlateCarree())
-            else:
-                ax = fig.add_subplot(2, len(times), idx)
-                ax.set_xlim(extent[:2]), ax.set_ylim(extent[2:])
-                tr = {}
-            snap = m2.sel(time=t, method="nearest")
-            fld = (snap[field] - 273.15) if field == "T" else snap[field] * scale
-            mesh = ax.pcolormesh(
-                snap["lon"], snap["lat"], fld, cmap=cmap, zorder=3,
-                vmin=tmin if field == "T" else 4,
-                vmax=tmax if field == "T" else 20, alpha=0.8, **tr)
-            step = 2  # barb thinning
-            blon, blat = np.meshgrid(snap["lon"].values[::step],
-                                     snap["lat"].values[::step])
-            ax.barbs(blon, blat, snap["U"].values[::step, ::step],
-                     snap["V"].values[::step, ::step],
-                     length=4.5, linewidth=0.6, zorder=4, **tr)
-            fr = fronts["1wide"]["fronts"].sel(time=t, method="nearest").sel(**box)
-            for i, ftype in enumerate(
-                    str(x) for x in fronts["1wide"]["front_type"].values):
-                if ftype not in FRONT_COLORS:
-                    continue
-                on = fr.isel(front=i).values > 0
-                yy, xx = np.where(on)
-                if yy.size:
-                    ax.plot(fr["lon"].values[xx], fr["lat"].values[yy], "s",
-                            ms=7, mec="k", mew=0.4, color=FRONT_COLORS[ftype],
-                            zorder=5, **tr)
-            ax.plot(plon, plat, marker="*", ms=16, mec="k", mfc="cyan",
-                    zorder=6, **tr)
+    for row, (field, cmap, unit, scale) in enumerate(FIELDS):
+        for coli, t in enumerate(times):
+            ax, mesh = draw_panel(fig, (2, len(times),
+                                        row * len(times) + coli + 1),
+                                  t, field, cmap, unit, scale)
             if row == 0:
-                ax.set_title(f"{pd.Timestamp(snap['time'].item()):%H}Z "
-                             f"{pd.Timestamp(snap['time'].item()):%b-%d}",
-                             fontsize=11)
-            if col == len(times) - 1:
+                snap_t = pd.Timestamp(m2.sel(time=t, method="nearest")
+                                      ["time"].item())
+                ax.set_title(f"{snap_t:%H}Z {snap_t:%b-%d}", fontsize=11)
+            if coli == len(times) - 1:
                 meshes.append((mesh, unit))
     for k, (mesh, unit) in enumerate(meshes):
         cax = fig.add_axes([0.92, 0.55 - 0.45 * k, 0.011, 0.33])
@@ -182,18 +207,29 @@ def main(argv=None) -> None:
                           label=n) for n, c in FRONT_COLORS.items()]
     fig.legend(handles=handles, loc="lower center", ncol=4, frameon=False,
                fontsize=10)
-    fig.suptitle(f"WPC analyst fronts + MERRA-2 925-hPa T / q / wind, "
+    fig.suptitle(f"WPC analyst fronts + MERRA-2 925-hPa T / q / wind + SLP, "
                  f"{day:%Y-%m-%d} window (star = {plat:g}N {abs(plon):g}W)",
                  fontsize=14)
     fig.subplots_adjust(left=0.03, right=0.90, top=0.90, bottom=0.08,
                         wspace=0.06, hspace=0.08)
-
     out = args.out / f"{day:%Y%m%d}_{cell[0]:g}N_{abs(cell[1]):g}W"
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"fronts_context_{day:%Y%m%d}.png"
     fig.savefig(path, dpi=160, bbox_inches="tight")
     (out / "front_flags.txt").write_text("\n".join(flag_lines) + "\n")
     print(f"saved {path}")
+
+    if args.single is not None:
+        t = day + pd.Timedelta(hours=args.single)
+        fig1 = plt.figure(figsize=(13, 5.2))
+        for k, (field, cmap, unit, scale) in enumerate(FIELDS):
+            ax, mesh = draw_panel(fig1, (1, 2, k + 1), t, field, cmap, unit,
+                                  scale)
+            fig1.colorbar(mesh, ax=ax, shrink=0.85, pad=0.02, label=unit)
+        fig1.subplots_adjust(wspace=0.30)
+        p1 = out / f"fronts_context_{day:%Y%m%d}_single_{t:%H}Z_{t:%d}.png"
+        fig1.savefig(p1, dpi=170, bbox_inches="tight")
+        print(f"saved {p1}")
 
 
 if __name__ == "__main__":

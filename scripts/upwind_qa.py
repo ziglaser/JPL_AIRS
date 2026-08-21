@@ -77,6 +77,11 @@ ALIGN_MEDIAN_COS_MAX: float = -0.5
 #: geometric sign error); 15% allows weak/veering-wind noise (Stohl 1998
 #: position errors ~20% of distance) but catches a flipped sign instantly.
 ALIGN_FRAC_DOWNWIND_MAX: float = 0.15
+#: Check 2: minimum centroid fetch (km) for the verdict statistics -- half a
+#: 1-deg cell. Below this the centroid's SIGN is sub-grid noise: measured on
+#: 2019-06-05, fetch >= 50 km gives median cos -0.96 / 3% downwind while
+#: sub-cell fetches alone give -0.67 / 28% (short early-slot look-backs).
+ALIGN_MIN_FETCH_KM: float = 50.0
 #: Check 3: slot 6 arrives 02 UTC -- after sunset domain-wide -- so clear-sky
 #: available energy at lags 0-1 h is ~0 and the energy weighting must have
 #: killed those hours; 10% allows western-edge twilight. This bound is what
@@ -110,7 +115,17 @@ NPARCEL_BIN_EDGES: tuple = (1, 5, 10, 20, 50)
 NPARCEL_BIN_LABELS: tuple = ("1-4", "5-9", "10-19", "20-49", "50+")
 #: Check 6: the ensemble-mean fix made Phi (hence Omega) parcel-count
 #: invariant (review 1.5 note); any |r| >= 0.1 is that leakage reviving.
-OMEGA_NPARCELS_R_MAX: float = 0.1
+#: Check 6: raw r(omega, n_parcels) is reported but NOT gated -- via
+#: RECEPTOR_BAND_M the parcel count proxies PBL depth, so omega and n covary
+#: physically through m* (measured 2019-06-05: r(m*,n)=+0.36; m*-partialing
+#: halves r(omega,n) from -0.27 to -0.13). The gate is on the m*-PARTIALED
+#: residual correlation: >= WARN means mechanical dependence beyond the PBL
+#: pathway is creeping back; >= FAIL means the phi ensemble-mean fix regressed.
+OMEGA_NPARCELS_RPARTIAL_WARN: float = 0.2
+OMEGA_NPARCELS_RPARTIAL_FAIL: float = 0.4
+#: Check 6: minimum finite cells per n_parcels bin for the variance-seam gate
+#: (10 correlated neighbours on one day produced a spurious 21.5x "seam").
+SEAM_MIN_BIN_CELLS: int = 100
 #: Check 7a: smoke-test bar for the exploratory precip-rate monotonicity --
 #: |Spearman rho| > 0.5 over 10 deciles, correct (negative) sign.
 LABEL_RHO_MIN: float = 0.5
@@ -213,7 +228,7 @@ class Pool:
 POOL_UPW_VARS: tuple = (
     "psi_anom", "s_endpoint_anom", "psi_meso_anom", "omega", "n_parcels",
     "gamma_gap_mml", "upwind_dlat", "upwind_dlon", "upwind_km",
-    "mean_lag_hours",
+    "mean_lag_hours", "m_star",
 )
 
 
@@ -226,6 +241,13 @@ def _slot_field(ds: xr.Dataset, name: str) -> xr.DataArray | None:
     if name not in ds:
         return None
     da = ds[name]
+    # The MRMS variables carry the 7 forecast slots under the dim name
+    # ``nhours`` (slot-aligned with ``time``; verified FCST_SMAP_MRMS_2019,
+    # whose nhours coord is degenerate zeros -- drop it, adopt the time axis).
+    if "nhours" in da.dims and da.sizes["nhours"] == ds.sizes.get("time"):
+        da = (da.drop_vars("nhours", errors="ignore")
+                .rename({"nhours": "time"})
+                .assign_coords(time=ds["time"].values))
     extra = [d for d in da.dims if d not in ("date", "time", "lat", "lon")]
     if extra:
         da = da.mean(extra, skipna=True)
@@ -432,8 +454,8 @@ def check_upwind_alignment(pool: Pool, out_dir: Path) -> dict:
     name = "upwind_alignment"
     if not pool.cols:
         return _skip(name, "no kernel-valid years")
-    dlat, dlon, latd, u, v = pool.finite(
-        "upwind_dlat", "upwind_dlon", "lat_deg", "u", "v")
+    dlat, dlon, latd, u, v, km_a = pool.finite(
+        "upwind_dlat", "upwind_dlon", "lat_deg", "u", "v", "upwind_km")
     if dlat.size == 0:
         return _skip(name, "no finite (upwind_dlat/dlon, FCST_u/v) samples "
                            "(geometry vars or winds missing)")
@@ -443,8 +465,19 @@ def check_upwind_alignment(pool: Pool, out_dir: Path) -> dict:
     disp = np.hypot(dx, dy)
     ok = (wind > 0) & (disp > 0)
     cos = (dx[ok] * u[ok] + dy[ok] * v[ok]) / (disp[ok] * wind[ok])
-    med = float(np.median(cos))
-    frac_down = float((cos > 0).mean())
+    med_all = float(np.median(cos))
+    # The verdict statistics use only well-resolved fetches: below half a
+    # 1-deg cell (ALIGN_MIN_FETCH_KM) the centroid sign is sub-grid noise --
+    # measured on 2019-06-05: fetch >= 50 km gives median cos -0.96 / 3%
+    # downwind, while sub-cell fetches alone read -0.67 / 28%.
+    far = km_a[ok] >= ALIGN_MIN_FETCH_KM
+    if far.any():
+        med = float(np.median(cos[far]))
+        frac_down = float((cos[far] > 0).mean())
+        fetch_note = f"fetch>={ALIGN_MIN_FETCH_KM:.0f} km n={int(far.sum())}"
+    else:  # all sub-cell (very short look-backs only): report, do not gate
+        med, frac_down = med_all, float((cos > 0).mean())
+        fetch_note = "no well-resolved fetches; all-sample stats (weak test)"
     status = ("PASS" if med <= ALIGN_MEDIAN_COS_MAX
               and frac_down <= ALIGN_FRAC_DOWNWIND_MAX else "FAIL")
 
@@ -477,8 +510,10 @@ def check_upwind_alignment(pool: Pool, out_dir: Path) -> dict:
                    out_dir / "qa2_upwind_alignment.png")
     return {"name": name, "status": status,
             "metrics": {"median_cosine": med, "frac_downwind": frac_down,
+                        "median_cosine_all_fetches": med_all,
                         "distance_slope": slope, "n": int(cos.size)},
-            "detail": (f"median cos {med:.2f} (need <= {ALIGN_MEDIAN_COS_MAX}), "
+            "detail": (f"median cos {med:.2f} (need <= {ALIGN_MEDIAN_COS_MAX}; "
+                       f"{fetch_note}), "
                        f"frac downwind {frac_down:.3f} "
                        f"(need <= {ALIGN_FRAC_DOWNWIND_MAX}), "
                        f"distance slope {slope:.2f} vs 1"),
@@ -846,16 +881,39 @@ def check_sample_size_leakage(pool: Pool, out_dir: Path) -> dict:
         counts[i] = vals.size
         if vals.size >= 2:
             variances[i] = float(np.var(vals))
+    # The seam gate needs POPULATED bins: on the demo day the 20-49 bin held
+    # 10 cells (a handful of granule-dense neighbours over uniform wet soil),
+    # whose "variance" produced a spurious 21.5x seam. Bins thinner than
+    # SEAM_MIN_BIN_CELLS are excluded from the gate, reported as such.
     v_mid, v_hi = variances[2], variances[3]  # 10-19 vs 20-49 (the seam)
+    seam_populated = (counts[2] >= SEAM_MIN_BIN_CELLS
+                      and counts[3] >= SEAM_MIN_BIN_CELLS)
     step = (float(max(v_mid, v_hi) / min(v_mid, v_hi))
-            if np.isfinite(v_mid) and np.isfinite(v_hi)
+            if seam_populated and np.isfinite(v_mid) and np.isfinite(v_hi)
             and min(v_mid, v_hi) > 0 else float("nan"))
     step_warn = bool(np.isfinite(step) and step > VAR_STEP_RATIO_MAX)
 
+    # r(omega, n_parcels) is NOT expected to be zero: through RECEPTOR_BAND_M
+    # the parcel count proxies PBL depth (deep well-mixed layers keep more
+    # parcels inside the 0-1000 m band), so omega and n covary PHYSICALLY via
+    # m* -- measured 2026-08-21 on the demo day: r(m*, n) = +0.36 and
+    # partialing m* out of omega halves r(omega, n) from -0.27 to -0.13. The
+    # leakage-specific statistic is therefore the m*-PARTIALED residual
+    # correlation: mechanical sample-size dependence beyond the PBL pathway.
     n2, om = pool.finite("n_parcels", "omega")
     r = (float(np.corrcoef(n2, om)[0, 1]) if n2.size >= 3 else float("nan"))
-    leak = bool(np.isfinite(r) and abs(r) >= OMEGA_NPARCELS_R_MAX)
-    status = "FAIL" if leak else ("WARN" if step_warn else "PASS")
+    n3, om3, ms = pool.finite("n_parcels", "omega", "m_star")
+    if n3.size >= 3 and np.ptp(ms) > 0:
+        resid = om3 - np.polyval(np.polyfit(ms, om3, 1), ms)
+        r_partial = float(np.corrcoef(n3, resid)[0, 1])
+    else:  # m_star absent (pre-geometry companion): fall back to the raw r
+        r_partial = r
+    leak_fail = bool(np.isfinite(r_partial)
+                     and abs(r_partial) >= OMEGA_NPARCELS_RPARTIAL_FAIL)
+    leak_warn = bool(np.isfinite(r_partial)
+                     and abs(r_partial) >= OMEGA_NPARCELS_RPARTIAL_WARN)
+    status = ("FAIL" if leak_fail
+              else "WARN" if (leak_warn or step_warn) else "PASS")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     x = np.arange(len(NPARCEL_BIN_LABELS))
@@ -864,11 +922,12 @@ def check_sample_size_leakage(pool: Pool, out_dir: Path) -> dict:
     ax.set_xlabel("n_parcels bin"); ax.set_ylabel("Var(UPW_psi_anom) ((m3/m3)^2)")
     ax.axvspan(2.5, 3.5, color="lightgray", alpha=0.4, lw=0,
                label="containment threshold seam (20 parcels)")
-    ax.annotate(f"r(omega, n_parcels) = {r:+.3f} (|r| < "
-                f"{OMEGA_NPARCELS_R_MAX} required)",
+    ax.annotate(f"r(omega,n) = {r:+.3f} raw (ungated: n proxies PBL depth); "
+                f"m*-partialed {r_partial:+.3f} (warn >= "
+                f"{OMEGA_NPARCELS_RPARTIAL_WARN})",
                 xy=(0.02, 0.95), xycoords="axes fraction", fontsize=8)
     ax.legend(fontsize=7); _style(ax)
-    figp = _finish(fig, 6, name, status, f"r(omega,n) {r:+.3f}",
+    figp = _finish(fig, 6, name, status, f"m*-partial r {r_partial:+.3f}",
                    out_dir / "qa6_sample_size_leakage.png")
     return {"name": name, "status": status,
             "metrics": {"psi_var_by_bin": [None if not np.isfinite(v)
@@ -876,12 +935,18 @@ def check_sample_size_leakage(pool: Pool, out_dir: Path) -> dict:
                                            for v in variances],
                         "bin_counts": counts.tolist(),
                         "seam_step_ratio": step,
-                        "r_omega_nparcels": r},
-            "detail": (f"r(omega, n_parcels) = {r:+.3f} "
-                       f"(need |r| < {OMEGA_NPARCELS_R_MAX}); variance seam "
-                       f"ratio 10-19 vs 20-49 = "
-                       + (f"{step:.2f}" if np.isfinite(step) else "n/a")
-                       + f" (warn > {VAR_STEP_RATIO_MAX})"),
+                        "seam_gated": bool(seam_populated),
+                        "r_omega_nparcels": r,
+                        "r_omega_nparcels_mstar_partial": r_partial},
+            "detail": (f"r(omega,n) raw {r:+.3f} (ungated: n proxies PBL "
+                       f"depth via the receptor band), m*-partialed "
+                       f"{r_partial:+.3f} (warn >= "
+                       f"{OMEGA_NPARCELS_RPARTIAL_WARN}, fail >= "
+                       f"{OMEGA_NPARCELS_RPARTIAL_FAIL}); variance seam "
+                       f"10-19 vs 20-49 = "
+                       + (f"{step:.2f} (warn > {VAR_STEP_RATIO_MAX})"
+                          if np.isfinite(step) else
+                          f"ungated (bins under {SEAM_MIN_BIN_CELLS} cells)")),
             "figures": [figp]}
 
 

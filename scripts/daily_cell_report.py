@@ -234,47 +234,32 @@ def merra2_point(day: pd.Timestamp, lat: float, lon: float,
     return m2
 
 
-#: dataset level markers (MU parcel heights + PBLH; MML dropped per Zach
-#: 2026-08-20): row -> (color, linestyle, FIXED label x-slot in axes fraction,
-#: staggered off to the right so close-packed lines never collide)
-LEVEL_MARKERS = {
-    "MU LCL [m]":  ("tab:orange", "-", 0.26),
-    "MU LFC [m]":  ("tab:purple", "-", 0.52),
-    "MU EL [m]":   ("tab:brown", "-", 0.60),
-    "PBL depth (Guo 3-hrly, interp) [m]": ("tab:blue", "-", 0.70),
+#: level-marker styling: short name -> (color, linestyle, FIXED label x-slot
+#: in axes fraction, staggered so close-packed lines never collide). Values
+#: are dataset-specific per panel (AIRS-FCST levels on the AIRS panel,
+#: MERRA-2-derived levels on the MERRA-2 panel); only the Guo PBLH height is
+#: shared, converted to pressure through each panel's own column.
+#: (color, linestyle, label x-slot, label side): PBLH labels BELOW its line,
+#: parcel levels ABOVE theirs, so near-coincident lines never collide
+LEVEL_STYLE = {
+    "MU LCL": ("tab:orange", "-", 0.26, "bottom"),
+    "MU LFC": ("tab:purple", "-", 0.46, "bottom"),
+    "PBLH":   ("tab:blue", "-", 0.62, "top"),
 }
-#: which marker rows go on which panel: the full skew-T keeps only the EL
-#: (the low-level lines live on the BL zoom, where they are legible)
-FULL_MARKERS = ("MU EL [m]",)
-ZOOM_MARKERS = ("MU LCL [m]", "MU LFC [m]",
-                "PBL depth (Guo 3-hrly, interp) [m]")
 
 
-def _add_level_markers(skew, col: pd.Series, p_of_z, fontsize=7.5,
-                       only=None) -> None:
-    """Horizontal lines at the dataset's LCL/LFC/EL/PBLH for one forecast hour.
-
-    Heights are AGL (the AIRS-FCST datum was verified AGL, and the Guo PBLH is
-    AGL by construction); ``p_of_z`` converts to pressure via the day's own
-    parcel alt/pres relation (or a fallback profile when no parcels exist).
-    Labels sit inside the axes at staggered x positions so the tight
-    LCL/LFC/PBLH cluster stays legible.
-    """
-    for row, (color, ls, x0) in LEVEL_MARKERS.items():
-        if only is not None and row not in only:
+def _add_level_markers(skew, entries, fontsize=11) -> None:
+    """Horizontal level lines from ``entries`` = [(name, pressure_hPa,
+    height_m_AGL), ...]; labels at each name's fixed x-slot."""
+    for name, p_hpa, z_m in entries:
+        if not np.isfinite(p_hpa):
             continue
-        z = float(col.get(row, np.nan))
-        if not np.isfinite(z):
-            continue
-        p = p_of_z(z)
-        if not np.isfinite(p):
-            continue
-        skew.ax.axhline(p, color=color, ls=ls, lw=1.4, alpha=0.85)
-        short = row.split(" [")[0].replace("PBL depth (Guo 3-hrly, interp)",
-                                           "PBLH")
-        skew.ax.text(x0, p, f"{short} {z:.0f}m", color=color,
+        color, ls, x0, side = LEVEL_STYLE[name]
+        skew.ax.axhline(p_hpa, color=color, ls=ls, lw=1.4, alpha=0.85)
+        z_txt = f" {z_m:.0f}m" if np.isfinite(z_m) else ""
+        skew.ax.text(x0, p_hpa, f"{name}{z_txt}", color=color,
                      fontsize=fontsize, fontweight="bold",
-                     va="bottom", ha="left", clip_on=True,
+                     va=side, ha="left", clip_on=True,
                      transform=skew.ax.get_yaxis_transform(),
                      bbox=dict(fc="white", ec="none", alpha=0.85, pad=0.8))
 
@@ -359,8 +344,17 @@ def _parcel_analysis(p, t, td, mpcalc, units, launch=None):
                                      d0 * units.degC).to("degC")
         cape, cin = mpcalc.cape_cin(pf * units.hPa, envf * units.degC,
                                     envdf * units.degC, prof)
+        lcl_p, _ = mpcalc.lcl(pf[0] * units.hPa, t0 * units.degC,
+                              d0 * units.degC)
+        try:
+            lfc_p, _ = mpcalc.lfc(pf * units.hPa, envf * units.degC,
+                                  envdf * units.degC, prof)
+            lfc_p = float(lfc_p.to("hPa").magnitude)
+        except Exception:
+            lfc_p = np.nan
         return dict(p=pf * units.hPa, env_t=envf * units.degC,
                     env_td=envdf * units.degC, prof=prof,
+                    lcl_p=float(lcl_p.to("hPa").magnitude), lfc_p=lfc_p,
                     cape=float(cape.magnitude), cin=float(cin.magnitude))
     except Exception as err:
         print(f"      parcel analysis skipped ({err})")
@@ -393,7 +387,7 @@ def _binned_median(p, x, bin_hpa: float, min_n: int = 1):
 
 def _draw_panel(skew, parc, m2near, col, mpcalc, units,
                 ylim, xlim, bin_hpa, label_fs, legend=False, pa=None,
-                ground_hpa=None, markers=None):
+                ground_hpa=None, level_entries=()):
     """One Skew-T panel: parcels, MERRA-2 profile, CAPE/CIN, level markers."""
     if pa is not None:  # MU parcel path + shaded CAPE (red) / CIN (blue)
         skew.plot(pa["p"], pa["prof"], "k-", lw=1.6, alpha=0.9,
@@ -432,9 +426,7 @@ def _draw_panel(skew, parc, m2near, col, mpcalc, units,
         skew.ax.axhspan(ground_hpa, ylim[0] + 20, facecolor="tan",
                         edgecolor="saddlebrown", hatch="///", lw=0,
                         alpha=0.5, zorder=1.5)
-    p_of_z = (parc["p_of_z"] if parc is not None
-              else (lambda z: 1013.25 * np.exp(-z / 8400.0)))
-    _add_level_markers(skew, col, p_of_z, fontsize=label_fs, only=markers)
+    _add_level_markers(skew, level_entries, fontsize=label_fs)
     skew.ax.set_ylim(*ylim)
     skew.ax.set_xlim(*xlim)
     skew.ax.set_xlabel("Temperature ($^\\circ$C)")
@@ -557,11 +549,46 @@ def plot_skewts(out: Path, day: pd.Timestamp, point: tuple[float, float],
 
         ps_hpa = (float(m2near["PS"]) / 100.0 if m2near is not None
                   and "PS" in m2near else np.nan)
+        pblh_z = float(col.get("PBL depth (Guo 3-hrly, interp) [m]", np.nan))
+
+        # AIRS-FCST levels: dataset heights -> pressure via the parcels' own
+        # alt/pres relation
+        p_of_z = (parc["p_of_z"] if parc is not None
+                  else (lambda z: 1013.25 * np.exp(-z / 8400.0)))
+        airs_entries = []
+        for name, row in (("MU LCL", "MU LCL [m]"), ("MU LFC", "MU LFC [m]"),
+                          ("PBLH", None)):
+            z = pblh_z if row is None else float(col.get(row, np.nan))
+            airs_entries.append(
+                (name, p_of_z(z) if np.isfinite(z) else np.nan, z))
+
+        # MERRA-2 levels: derived from ITS OWN profile (metpy LCL/LFC of the
+        # MU parcel analysis); heights AGL via the file's geopotential H(p)
+        # referenced to the surface pressure. Only the Guo PBLH is shared.
+        merra_entries = []
+        if m2near is not None and pa_m2 is not None and "H" in m2near:
+            pl = m2near["lev"].values
+            hh = m2near["H"].values
+            fin = np.isfinite(hh)
+            lp = np.log(pl[fin])
+            oo = np.argsort(lp)
+            lp, hh = lp[oo], hh[fin][oo]
+            h_sfc = np.interp(np.log(ps_hpa), lp, hh)
+            h_of_p = lambda q: float(np.interp(np.log(q), lp, hh) - h_sfc)  # noqa: E731
+            hagl = hh - h_sfc
+            ho = np.argsort(hagl)
+            p_of_h = lambda z: float(np.exp(np.interp(z, hagl[ho], lp[ho])))  # noqa: E731
+            for name, q in (("MU LCL", pa_m2["lcl_p"]),
+                            ("MU LFC", pa_m2["lfc_p"])):
+                merra_entries.append(
+                    (name, q, h_of_p(q) if np.isfinite(q) else np.nan))
+            if np.isfinite(pblh_z):
+                merra_entries.append(("PBLH", p_of_h(pblh_z), pblh_z))
         skew_full = SkewT(fig, rotation=45, subplot=gs[0, 0])
         _draw_panel(skew_full, parc, None, col, mpcalc, units,
                     ylim=(1050, 200), xlim=(-30, 45), bin_hpa=25,
                     label_fs=10, legend=True, pa=pa_hy,
-                    ground_hpa=ps_hpa, markers=FULL_MARKERS)
+                    ground_hpa=ps_hpa)
         skew_full.ax.set_title("AIRS-FCST", fontsize=12)
         _tag_cape_cin(skew_full, pa_hy, ds_cape=ds_cape, ds_cin=ds_cin)
 
@@ -573,14 +600,14 @@ def plot_skewts(out: Path, day: pd.Timestamp, point: tuple[float, float],
         _draw_panel(skew_zoom, parc, None, col, mpcalc, units,
                     ylim=(1050, 750), xlim=(-30, 45), bin_hpa=10,
                     label_fs=11, pa=pa_hy,
-                    ground_hpa=ps_hpa, markers=ZOOM_MARKERS)
+                    ground_hpa=ps_hpa, level_entries=airs_entries)
 
 
         skew_m2 = SkewT(fig, rotation=45, subplot=gs[0, 1])
         _draw_panel(skew_m2, None, m2near, col, mpcalc, units,
                     ylim=(1050, 200), xlim=(-30, 45), bin_hpa=25,
                     label_fs=10, legend=True, pa=pa_m2,
-                    ground_hpa=ps_hpa, markers=FULL_MARKERS)
+                    ground_hpa=ps_hpa)
         skew_m2.ax.set_title("MERRA-2", fontsize=12)
         _tag_cape_cin(skew_m2, pa_m2)
 
@@ -588,7 +615,7 @@ def plot_skewts(out: Path, day: pd.Timestamp, point: tuple[float, float],
         _draw_panel(skew_m2z, None, m2near, col, mpcalc, units,
                     ylim=(1050, 750), xlim=(-30, 45), bin_hpa=10,
                     label_fs=11, pa=pa_m2,
-                    ground_hpa=ps_hpa, markers=ZOOM_MARKERS)
+                    ground_hpa=ps_hpa, level_entries=merra_entries)
 
 
         fig.tight_layout()

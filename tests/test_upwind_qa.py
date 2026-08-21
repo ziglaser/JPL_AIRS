@@ -219,8 +219,15 @@ def _build_world(root: Path, *, flip_wind: bool = False,
         "FCST_MML_LFC": (dims, (gamma_gap + _PBLH_M).astype(np.float32)),
     }
     if not drop_mrms:
-        fcst_vars["MRMS_GaugeCorrQPE01H_av"] = (dims, rain_av.astype(np.float32))
-        fcst_vars["MRMS_GaugeCorrQPE01H_max"] = (dims, rain_max.astype(np.float32))
+        # real FCST_SMAP_MRMS files carry the MRMS variables on a dim named
+        # `nhours` (slot-aligned with `time`, degenerate all-zero coord) --
+        # mirror that exactly; a `time`-dimmed MRMS fixture masked the
+        # 2026-08-21 production crash in _slot_field
+        mrms_dims = ("date", "nhours", "lat", "lon")
+        fcst_vars["MRMS_GaugeCorrQPE01H_av"] = (mrms_dims, rain_av.astype(np.float32))
+        fcst_vars["MRMS_GaugeCorrQPE01H_max"] = (mrms_dims, rain_max.astype(np.float32))
+        coords = {**coords, "nhours": ("nhours", np.zeros(len(coords["time"][1])
+                  if isinstance(coords["time"], tuple) else len(coords["time"])))}
     xr.Dataset(fcst_vars, coords=coords).to_netcdf(
         fcst_dir / "FCST_SMAP_MRMS_2019.nc")
 
