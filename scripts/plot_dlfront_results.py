@@ -14,17 +14,31 @@ Outputs, written to ``<results-dir>/summary_plots/``:
 * ``training_curves.png``       loss/val_loss vs epoch, one panel per
                                 (fold, stage) model dir matching
                                 ``D6[ABC]-f<n>``, laid out fold x stage.
-* ``csi_comparison.png``        FOLD-POOLED metric grid: rows CSI/POD/FAR x
-                                one column per front type (bars grouped by
+* ``csi_comparison_<source>.png``  FOLD-POOLED metric grid, ONE FILE PER
+                                TEST SOURCE (``reanalysis`` /
+                                ``kriged-airs``): rows CSI/POD/FAR x one
+                                column per front type (bars grouped by
                                 pooled leg, CI whiskers on the CSI row),
                                 plus one panel of all-categories accuracy
-                                from the ``*_paper.json`` files.
-* ``csi_comparison_f<k>.png``   the pre-pooling per-fold figure, only under
+                                from the ``*_paper.json`` files.  Each file
+                                holds only the legs whose ``_<source>``
+                                suffix matches, PLUS ``bk19`` in BOTH files
+                                (the fixed published benchmark every leg is
+                                measured against, so it repeats).  An
+                                ``-ens<n>_`` ensemble leg (the deployed
+                                product's own score) orders FIRST among the
+                                model legs, right after bk19; the pooled
+                                stage legs (recipe estimates) follow.
+* ``csi_comparison_<source>_f<k>.png``  the pre-pooling per-fold figure,
+                                split by source the same way, only under
                                 ``--per-fold`` (debugging aid).
-* ``permutation_importance.png``  CSI cost (baseline - shuffled) per input
-                                channel from ``permutation/*.csv``, bars
-                                grouped by pooled checkpoint, one panel per
-                                source.
+* ``permutation_importance_<source>.png``  CSI cost (baseline - shuffled)
+                                per input channel from
+                                ``permutation/*.csv``, ONE FILE PER SOURCE,
+                                one panel per FRONT TYPE (shared y-limits
+                                within a figure so fronts compare at a
+                                glance), bars grouped by pooled checkpoint
+                                (ladder stems auto-included).
 * ``ablation_ladder.png``       CSI vs channel-ladder rung (5ch -> 3ch ->
                                 2ch) from ``ablation_eval/*.csv``, bars
                                 grouped by source with pooled CI whiskers,
@@ -77,6 +91,26 @@ RUNG_RE = re.compile(r"^D6A(\d+)$")
 #: CSV (dl_front.permutation.BASELINE -- not imported: that module pulls in
 #: the TF-adjacent dl_front package and this script must stay plain-python).
 PERM_BASELINE = "<baseline>"
+#: Canonical front-type ordering, mirroring dl_front.config.CLASS_NAMES_6
+#: minus the "none" class (not imported: that package is TF-adjacent and
+#: this script must stay plain-python).  Panels/columns follow this order so
+#: every figure reads the same way; fronts not listed (future types) sort
+#: after it alphabetically rather than crashing.
+FRONT_ORDER = ("cold", "warm", "stationary", "occluded", "dryline")
+#: The two test sources evaluate_test writes as leg-name ``_<source>``
+#: suffixes.  Per-source figures iterate over these (plus any extra source
+#: discovered in the data) so a missing source SKIPS with a note instead of
+#: silently producing no file.
+EXPECTED_SOURCES = ("reanalysis", "kriged-airs")
+#: The published-benchmark leg: no fold, no source suffix, no paper json.
+#: It is the fixed external reference every leg is measured against, so it
+#: repeats in EVERY per-source comparison figure.
+BENCHMARK_LEG = "bk19"
+#: Ensemble legs -- exported softmax-ensemble archives scored as their own
+#: named leg (e.g. ``D6C-ens3_kriged-airs``).  The ``-ens<n>_`` tag sits
+#: where a fold tag would (before the ``_<source>`` suffix), and n is the
+#: member count.
+ENS_LEG_RE = re.compile(r"-ens\d+_")
 
 #: dataviz reference categorical theme (references/palette.md), fixed order
 #: -- used here for LEG identity (checkpoint x source), a different
@@ -95,6 +129,47 @@ def _style_ax(ax) -> None:
 def pooled_name(stem: str) -> str:
     """``D6C-f0_kriged-airs`` -> ``D6C_kriged-airs``; bk19 etc. unchanged."""
     return FOLD_TAG_RE.sub("", stem)
+
+
+def _ordered_fronts(fronts) -> list:
+    """Canonical FRONT_ORDER first, unknown extras alphabetically after --
+    so panel columns line up across every figure regardless of which fronts
+    a given results pull happens to contain."""
+    known = [f for f in FRONT_ORDER if f in set(fronts)]
+    extras = sorted(set(fronts) - set(FRONT_ORDER))
+    return known + extras
+
+
+def _leg_source(leg: str) -> str | None:
+    """Test source encoded as the leg's ``_<source>`` suffix
+    (``D6C_kriged-airs`` -> ``kriged-airs``); None for suffix-less legs
+    (bk19, which belongs to no source and repeats in every figure).
+    rpartition puts the WHOLE name in the last slot when there is no
+    ``_``, so the separator (not the tail) is the presence test."""
+    stem, sep, source = leg.rpartition("_")
+    return source if (sep and stem) else None
+
+
+def _legs_for_source(legs: dict, source: str) -> list:
+    """Leg names for one per-source comparison figure: the legs whose
+    ``_<source>`` suffix matches, PLUS bk19 (the fixed published benchmark
+    every leg is measured against, so it appears in BOTH files).  bk19 is
+    ordered FIRST -- the theme has no dedicated benchmark styling, so first
+    position is what marks it as the common reference.
+
+    WHY ensemble legs come next (user decision 2026-08-21): an ``-ens<n>_``
+    leg scores the exported softmax-ensemble archive -- the DEPLOYED
+    PRODUCT's own numbers -- whereas the fold-pooled stage legs are recipe
+    estimates (mean over folds of a training recipe).  User-facing
+    evaluations report the ensemble, so it is the headline and reads first
+    among the model legs; the pooled legs are kept, not dropped, because
+    the recipe estimate is still the right yardstick for retraining
+    decisions."""
+    matched = sorted(n for n in legs if _leg_source(n) == source)
+    ens = [n for n in matched if ENS_LEG_RE.search(n)]
+    rest = [n for n in matched if not ENS_LEG_RE.search(n)]
+    bench = [BENCHMARK_LEG] if BENCHMARK_LEG in legs else []
+    return bench + ens + rest
 
 
 # --------------------------------------------------------------------------- #
@@ -219,29 +294,40 @@ def _load_pooled_legs(test_eval_dir: Path) -> tuple:
 # CSI/POD/FAR + accuracy comparison (fold-pooled)
 # --------------------------------------------------------------------------- #
 
-def plot_csi_comparison(results_dir: Path, out_dir: Path) -> Path | None:
-    """Metric-row x front-column grid over the FOLD-POOLED legs.
+def plot_csi_comparison(results_dir: Path, out_dir: Path,
+                        source: str) -> Path | None:
+    """Metric-row x front-column grid over the FOLD-POOLED legs of ONE
+    test source (``csi_comparison_<source>.png``).
 
     Rows CSI / POD / FAR, one column per front type, bars grouped by pooled
     leg.  CI whiskers on the CSI row only -- POD/FAR carry no CIs in the
     per-leg CSVs.  The rightmost column is a single extra panel:
     all-categories accuracy per pooled leg from the ``*_paper.json`` files
-    (bk19 has none and is shown as absent).
+    (bk19 has none and is shown as absent).  Only legs with the matching
+    ``_<source>`` suffix appear, plus bk19 in EVERY source's file: it is
+    the fixed published benchmark all legs are measured against, so it
+    repeats (ordered first to mark it as the common reference).
     """
     test_eval_dir = results_dir / "test_eval"
     mismatched = (test_eval_dir / "comparison_MISMATCHED_SAMPLE.csv").exists()
-    legs, accuracy = _load_pooled_legs(test_eval_dir)
-    if not legs:
-        print(f"no per-leg eval CSVs under {test_eval_dir}; "
-              f"skipping csi_comparison.png")
+    all_legs, accuracy = _load_pooled_legs(test_eval_dir)
+    leg_names = _legs_for_source(all_legs, source)
+    # bk19 alone is not a comparison -- a source with no legs of its own
+    # skips, matching the per-source permutation figure's behavior.
+    if not [n for n in leg_names if n != BENCHMARK_LEG]:
+        print(f"no per-leg eval CSVs for source {source!r} under "
+              f"{test_eval_dir}; skipping csi_comparison_{source}.png")
         return None
+    legs = {n: all_legs[n] for n in leg_names}
     if len(legs) > len(LEG_PALETTE):
         print(f"WARNING: {len(legs)} pooled legs but only {len(LEG_PALETTE)} "
               f"validated palette slots -- some legs will repeat a color")
 
-    fronts = sorted({f for df in legs.values() for f in df["front"].unique()
-                    if f != "none"})
-    leg_names = sorted(legs)                  # fixed, deterministic order
+    fronts = _ordered_fronts({f for df in legs.values()
+                              for f in df["front"].unique() if f != "none"})
+    # leg_names order: bk19 first (common reference), then sorted source
+    # legs -- bk19 therefore holds palette slot 0 in BOTH source files, so
+    # the benchmark keeps one identity across figures.
     colors = {name: LEG_PALETTE[i % len(LEG_PALETTE)]
              for i, name in enumerate(leg_names)}
     metrics = ("csi", "pod", "far")
@@ -311,14 +397,15 @@ def plot_csi_comparison(results_dir: Path, out_dir: Path) -> Path | None:
               loc="lower center", ncol=min(len(leg_names), 4),
               frameon=False, fontsize=8, labelcolor=INK,
               bbox_to_anchor=(0.5, -0.02 - 0.03 * (len(leg_names) > 4)))
-    title = "fold-pooled CSI / POD / FAR + accuracy by leg"
+    title = (f"fold-pooled CSI / POD / FAR + accuracy by leg -- "
+             f"{source} test source (bk19 = published benchmark)")
     if mismatched:
         title += "  [WARNING: legs did not score identical samples]"
     fig.suptitle(title, color=("crimson" if mismatched else INK), fontsize=11)
     fig.tight_layout(rect=(0, 0.09, 1, 0.95))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "csi_comparison.png"
+    path = out_dir / f"csi_comparison_{source}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -350,22 +437,31 @@ def _load_legs(test_eval_dir: Path, fold: int) -> dict:
     return legs
 
 
-def plot_csi_comparison_fold(results_dir: Path, out_dir: Path,
-                             fold: int) -> Path | None:
+def plot_csi_comparison_fold(results_dir: Path, out_dir: Path, fold: int,
+                             source: str) -> Path | None:
+    """Per-fold, per-source variant of the pooled comparison
+    (``csi_comparison_<source>_f<k>.png``) -- same source split as the
+    pooled figure for consistency: only ``_<source>``-suffixed legs, plus
+    bk19 in every source's file (the common published benchmark, ordered
+    first)."""
     test_eval_dir = results_dir / "test_eval"
     mismatched = (test_eval_dir / "comparison_MISMATCHED_SAMPLE.csv").exists()
-    legs = _load_legs(test_eval_dir, fold)
-    if not legs:
-        print(f"no leg CSVs for fold {fold} under {test_eval_dir}; "
-              f"skipping csi_comparison_f{fold}.png")
+    all_legs = _load_legs(test_eval_dir, fold)
+    # Raw (unpooled) stems still end in ``_<source>``, so the same suffix
+    # rule applies; bk19 alone is not a comparison, so source-less trees
+    # skip here too.
+    leg_names = _legs_for_source(all_legs, source)
+    if not [n for n in leg_names if n != BENCHMARK_LEG]:
+        print(f"no leg CSVs for source {source!r}, fold {fold} under "
+              f"{test_eval_dir}; skipping csi_comparison_{source}_f{fold}.png")
         return None
+    legs = {n: all_legs[n] for n in leg_names}
     if len(legs) > len(LEG_PALETTE):
         print(f"WARNING: {len(legs)} legs but only {len(LEG_PALETTE)} "
               f"validated palette slots -- some legs will repeat a color")
 
-    fronts = sorted({f for df in legs.values() for f in df["front"].unique()
-                    if f != "none"})
-    leg_names = sorted(legs)                  # fixed, deterministic order
+    fronts = _ordered_fronts({f for df in legs.values()
+                              for f in df["front"].unique() if f != "none"})
     colors = {name: LEG_PALETTE[i % len(LEG_PALETTE)]
              for i, name in enumerate(leg_names)}
 
@@ -395,14 +491,15 @@ def plot_csi_comparison_fold(results_dir: Path, out_dir: Path,
     fig.legend(leg_names, loc="lower center", ncol=min(len(leg_names), 4),
               frameon=False, fontsize=8, labelcolor=INK,
               bbox_to_anchor=(0.5, -0.05 - 0.04 * (len(leg_names) > 4)))
-    title = f"CSI comparison, fold {fold}"
+    title = (f"CSI comparison, fold {fold} -- {source} test source "
+             f"(bk19 = published benchmark)")
     if mismatched:
         title += "  [WARNING: legs did not score identical samples]"
     fig.suptitle(title, color=("crimson" if mismatched else INK), fontsize=11)
     fig.tight_layout(rect=(0, 0.12, 1, 0.94))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"csi_comparison_f{fold}.png"
+    path = out_dir / f"csi_comparison_{source}_f{fold}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -413,7 +510,7 @@ def plot_csi_comparison_fold(results_dir: Path, out_dir: Path,
 # --------------------------------------------------------------------------- #
 
 def _load_permutation_costs(perm_dir: Path) -> pd.DataFrame | None:
-    """Tidy (source, ckpt, channel, csi_delta) frame, fold-pooled.
+    """Tidy (source, ckpt, front, channel, csi_delta) frame, fold-pooled.
 
     Column contract pinned to ``dl_front.permutation.CSV_COLUMNS``
     (channel, repeat, stat, front, dilation, km, csi, csi_lo, csi_hi, pod,
@@ -423,11 +520,12 @@ def _load_permutation_costs(perm_dir: Path) -> pd.DataFrame | None:
     Reduction per file: the "mean"-stat aggregate rows when the run had
     repeats > 1, else the single "raw" rows; the COARSEST dilation (the
     number the module's own headline and the ablation decision are made
-    on); mean over front types (per-front deltas share a currency -- CSI --
-    so the unweighted mean is the natural one-bar summary; per-front detail
-    stays in the CSVs).  Then folds pool by unweighted mean per the
-    module-level rule.  Channel order is order of first appearance, i.e.
-    the model's config.INPUT_CHANNELS order as written by the CSVs.
+    on).  The FRONT dimension is KEPT (one panel per front type in the
+    figure): a channel can matter for drylines and not for cold fronts,
+    and the old mean-over-fronts summary hid exactly that.  Then folds pool
+    by unweighted mean per the module-level rule.  Channel order is order
+    of first appearance, i.e. the model's config.INPUT_CHANNELS order as
+    written by the CSVs.
     """
     rows, channel_order = [], []
     for path in sorted(perm_dir.glob("*.csv")):
@@ -445,40 +543,57 @@ def _load_permutation_costs(perm_dir: Path) -> pd.DataFrame | None:
         for ch in sub["channel"]:
             if ch not in channel_order:
                 channel_order.append(ch)
-        cost = sub.groupby("channel", as_index=False)["csi_delta"].mean()
+        # groupby is a no-op mean for mean-stat rows (one per front x
+        # channel already); for raw rows it averages the repeats.
+        cost = sub.groupby(["front", "channel"],
+                           as_index=False)["csi_delta"].mean()
         rows.append(cost.assign(ckpt=pooled_name(ckpt), source=source))
     if not rows:
         return None
     tidy = (pd.concat(rows, ignore_index=True)
-            .groupby(["source", "ckpt", "channel"], as_index=False)
+            .groupby(["source", "ckpt", "front", "channel"], as_index=False)
             ["csi_delta"].mean())           # fold pooling
     tidy["channel"] = pd.Categorical(tidy["channel"], channel_order,
                                      ordered=True)
     return tidy
 
 
-def plot_permutation_importance(results_dir: Path,
-                                out_dir: Path) -> Path | None:
+def plot_permutation_importance(results_dir: Path, out_dir: Path,
+                                source: str) -> Path | None:
+    """Front-stratified CSI cost for ONE test source
+    (``permutation_importance_<source>.png``): one panel per front type,
+    x = channel, bars grouped by pooled checkpoint (ladder stems
+    auto-included).  Shared y-limits across panels so front types are
+    comparable at a glance -- the point of the stratification is exactly
+    the "matters for drylines, not for cold fronts" contrast."""
     perm_dir = results_dir / "permutation"
     tidy = _load_permutation_costs(perm_dir) if perm_dir.is_dir() else None
-    if tidy is None:
-        print(f"no permutation CSVs under {perm_dir}; "
-              f"skipping permutation_importance.png")
+    if tidy is not None:
+        tidy = tidy[tidy["source"] == source]
+    if tidy is None or tidy.empty:
+        print(f"no permutation CSVs for source {source!r} under {perm_dir}; "
+              f"skipping permutation_importance_{source}.png")
         return None
 
-    sources = sorted(tidy["source"].unique())
+    fronts = _ordered_fronts(tidy["front"].unique())
     # Fixed color per pooled checkpoint ACROSS panels (color follows the
     # entity): ladder rungs (D6A5/D6A3/D6A2) get slots automatically.
     ckpts = sorted(tidy["ckpt"].unique())
     colors = {c: LEG_PALETTE[i % len(LEG_PALETTE)]
              for i, c in enumerate(ckpts)}
+    # One y-window for EVERY front panel, from this source's full data
+    # range (sharey alone only links panels; the explicit limits also give
+    # negative costs -- shuffling that HELPED -- visible room).
+    lo = min(float(tidy["csi_delta"].min()), 0.0)
+    hi = max(float(tidy["csi_delta"].max()), 0.0)
+    pad = 0.05 * max(hi - lo, 1e-6)
 
-    fig, axes = plt.subplots(1, len(sources),
-                             figsize=(4.6 * len(sources), 4.2),
+    fig, axes = plt.subplots(1, len(fronts),
+                             figsize=(3.6 * len(fronts), 4.2),
                              squeeze=False, sharey=True)
-    for j, source in enumerate(sources):
+    for j, front in enumerate(fronts):
         ax = axes[0][j]
-        panel = tidy[tidy["source"] == source]
+        panel = tidy[tidy["front"] == front]
         chans = [c for c in tidy["channel"].cat.categories
                 if c in set(panel["channel"].astype(str))]
         present = [c for c in ckpts if (panel["ckpt"] == c).any()]
@@ -495,27 +610,28 @@ def plot_permutation_importance(results_dir: Path,
                   label=ckpt)
         ax.axhline(0, color="0.6", lw=0.8)
         ax.set_xticks(np.arange(len(chans)))
-        ax.set_xticklabels(chans, fontsize=8, color=INK)
-        ax.set_title(source, color=INK, fontsize=10)
+        ax.set_xticklabels(chans, fontsize=8, color=INK, rotation=30,
+                          ha="right")
+        ax.set_title(front, color=INK, fontsize=10)
         _style_ax(ax)
+        ax.set_ylim(lo - pad, hi + pad)
         if j == 0:
             ax.set_ylabel("CSI cost (baseline - shuffled)",
                          color=INK, fontsize=9)
-    # Handles built from the full ckpt->color map, not one panel's bars: a
-    # checkpoint probed only under one source must still appear in the
-    # legend (e.g. ladder rungs run reanalysis-only).
+    # Shared legend built from the full ckpt->color map, not one panel's
+    # bars: a checkpoint probed only for some fronts must still appear.
     handles = [plt.Rectangle((0, 0), 1, 1, color=colors[c]) for c in ckpts]
     fig.legend(handles, ckpts,
               loc="lower center", ncol=min(len(ckpts), 4),
               frameon=False, fontsize=8, labelcolor=INK,
               bbox_to_anchor=(0.5, -0.04))
-    fig.suptitle("permutation importance (fold-pooled; coarsest "
-                 "neighborhood, mean over front types)",
+    fig.suptitle(f"permutation importance by front type -- {source} "
+                 f"(fold-pooled; coarsest neighborhood)",
                  color=INK, fontsize=11)
     fig.tight_layout(rect=(0, 0.1, 1, 0.93))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "permutation_importance.png"
+    path = out_dir / f"permutation_importance_{source}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -642,10 +758,12 @@ def _selftest() -> int:
         out = root / "summary_plots"
 
         # -- empty tree: every plotter must skip, not crash ------------- #
-        for fn in (plot_training_curves, plot_csi_comparison,
-                   plot_permutation_importance, plot_ablation_ladder):
-            assert fn(root, out) is None, f"{fn.__name__} on empty tree"
-        assert plot_csi_comparison_fold(root, out, 0) is None
+        assert plot_training_curves(root, out) is None
+        assert plot_ablation_ladder(root, out) is None
+        for source in EXPECTED_SOURCES:
+            assert plot_csi_comparison(root, out, source) is None
+            assert plot_permutation_importance(root, out, source) is None
+            assert plot_csi_comparison_fold(root, out, 0, source) is None
 
         # -- models/ for the training curves ---------------------------- #
         mdir = root / "models" / "D6C-f0"
@@ -654,8 +772,10 @@ def _selftest() -> int:
                       "val_loss": np.linspace(1.1, .4, 5)}) \
             .to_csv(mdir / "history.csv", index=False)
 
-        # -- test_eval/: two folds of one leg (pool!), bk19 without CI
-        #    or paper json (accuracy panel must show it absent) ---------- #
+        # -- test_eval/: two folds of one kriged-airs leg (pool!), bk19
+        #    without CI or paper json (accuracy panel must show it absent),
+        #    plus one reanalysis leg added AFTER the source-missing check
+        #    below so both per-source comparison files render ------------ #
         tdir = root / "test_eval"
         tdir.mkdir()
         for k, seed in ((0, 0.00), (1, 0.10)):
@@ -666,17 +786,34 @@ def _selftest() -> int:
                               "front_no_front": 0.95},
                  "auc": 0.9}))
         eval_frame(0.05, with_ci=False).to_csv(tdir / "bk19.csv", index=False)
+        # Source-missing tree: no reanalysis legs yet -- bk19 alone must
+        # NOT produce a reanalysis comparison file (skip with a note).
+        assert plot_csi_comparison(root, out, "reanalysis") is None, \
+            "reanalysis comparison must skip when only bk19 is present"
+        assert plot_csi_comparison_fold(root, out, 0, "reanalysis") is None
+        eval_frame(0.12).to_csv(tdir / "D6C-f0_reanalysis.csv", index=False)
+        (tdir / "D6C-f0_reanalysis_paper.json").write_text(json.dumps(
+            {"accuracy": {"all_categories": 0.88, "front_no_front": 0.94},
+             "auc": 0.88}))
+        # Ensemble leg (the deployed product's own score): no fold tag --
+        # ``-ens3_`` sits where ``-f<k>_`` would -- and no paper json (it
+        # scores through the bk19-schema reader, which writes none).  Added
+        # to assert the headline ordering: ens leg FIRST among model legs,
+        # right after the bk19 benchmark.
+        eval_frame(0.07).to_csv(tdir / "D6C-ens3_kriged-airs.csv",
+                                index=False)
 
-        # -- permutation/: one main-chain and one ladder checkpoint ----- #
+        # -- permutation/: one main-chain and one ladder checkpoint, one
+        #    per source; the reanalysis file lands after the
+        #    source-missing skip check ----------------------------------- #
         pdir = root / "permutation"
         pdir.mkdir()
         perm_cols = ["channel", "repeat", "stat", "front", "dilation", "km",
                      "csi", "csi_lo", "csi_hi", "pod", "far", "fb",
                      "csi_delta", "pod_delta"]
-        for stem, chans in (("D6C-f0_kriged-airs",
-                             ("T2M", "QV2M", "SLP", "U10M", "V10M")),
-                            ("D6A5-f0_reanalysis",
-                             ("T2M", "QV2M", "SLP", "U10M", "V10M"))):
+
+        def perm_csv(stem: str,
+                     chans=("T2M", "QV2M", "SLP", "U10M", "V10M")) -> None:
             rows = []
             for front in ("cold", "warm"):
                 for dil, km in ((0, 0.0), (2, 222.4)):
@@ -692,6 +829,11 @@ def _selftest() -> int:
             pd.DataFrame(rows, columns=perm_cols) \
                 .to_csv(pdir / f"{stem}.csv", index=False)
 
+        perm_csv("D6C-f0_kriged-airs")
+        assert plot_permutation_importance(root, out, "reanalysis") is None, \
+            "reanalysis permutation must skip with no CSVs for that source"
+        perm_csv("D6A5-f0_reanalysis")
+
         # -- ablation_eval/: full ladder x two sources, two folds of one
         #    rung to exercise the pooling ------------------------------- #
         adir = root / "ablation_eval"
@@ -702,14 +844,17 @@ def _selftest() -> int:
                     adir / f"D6A{rung}-f0_{source}.csv", index=False)
         eval_frame(0.20).to_csv(adir / "D6A5-f1_reanalysis.csv", index=False)
 
-        # -- render + assert -------------------------------------------- #
+        # -- render + assert: the four per-source PNGs (both sources for
+        #    each family) plus the unsplit figures ----------------------- #
         made = {"training_curves.png": plot_training_curves(root, out),
-                "csi_comparison.png": plot_csi_comparison(root, out),
-                "csi_comparison_f0.png":
-                    plot_csi_comparison_fold(root, out, 0),
-                "permutation_importance.png":
-                    plot_permutation_importance(root, out),
                 "ablation_ladder.png": plot_ablation_ladder(root, out)}
+        for source in EXPECTED_SOURCES:
+            made[f"csi_comparison_{source}.png"] = \
+                plot_csi_comparison(root, out, source)
+            made[f"permutation_importance_{source}.png"] = \
+                plot_permutation_importance(root, out, source)
+            made[f"csi_comparison_{source}_f0.png"] = \
+                plot_csi_comparison_fold(root, out, 0, source)
         for name, path in made.items():
             assert path is not None, f"{name} was skipped on full fixtures"
             assert path.name == name, f"{path.name} != {name}"
@@ -717,18 +862,38 @@ def _selftest() -> int:
 
         # Pooling spot-checks (the rule, not just "a PNG exists"):
         legs, accuracy = _load_pooled_legs(tdir)
-        assert set(legs) == {"D6C_kriged-airs", "bk19"}, sorted(legs)
+        assert set(legs) == {"D6C_kriged-airs", "D6C_reanalysis", "bk19",
+                             "D6C-ens3_kriged-airs"}, sorted(legs)
+        # The ens leg must survive pooling UNRENAMED: ``-ens3_`` is not a
+        # fold tag, so FOLD_TAG_RE must not strip it.
+        assert pooled_name("D6C-ens3_kriged-airs") == "D6C-ens3_kriged-airs"
+        assert accuracy["D6C-ens3_kriged-airs"] is None  # no paper json
         cold0 = legs["D6C_kriged-airs"].query("front=='cold' & dilation==0")
         assert np.isclose(cold0["csi"].iloc[0], 0.25), cold0  # mean(.2, .3)
         assert np.isclose(accuracy["D6C_kriged-airs"], 0.91)
         assert accuracy["bk19"] is None      # absent, not zero
+        # bk19 appears in BOTH per-source comparison leg sets, ordered
+        # first (the common published benchmark repeats across files); the
+        # ensemble leg -- the deployed product -- is the headline and comes
+        # FIRST among model legs, before the pooled recipe legs (user
+        # decision 2026-08-21).
+        names = _legs_for_source(legs, "kriged-airs")
+        assert names == ["bk19", "D6C-ens3_kriged-airs",
+                         "D6C_kriged-airs"], names
+        names = _legs_for_source(legs, "reanalysis")
+        assert names == ["bk19", "D6C_reanalysis"], names
         costs = _load_permutation_costs(pdir)
         assert set(costs["ckpt"]) == {"D6C", "D6A5"}
+        assert set(costs["source"]) == set(EXPECTED_SOURCES)
+        # Front dimension survives the reduction (one panel per front).
+        assert set(costs["front"]) == {"cold", "warm"}, set(costs["front"])
         assert list(costs["channel"].cat.categories) == \
             ["T2M", "QV2M", "SLP", "U10M", "V10M"]
 
-    print("selftest OK: all five figures rendered from synthetic fixtures, "
-          "empty-tree auto-skip verified, fold pooling spot-checked")
+    print("selftest OK: per-source comparison + permutation figures (both "
+          "sources) rendered from synthetic fixtures, empty/source-missing "
+          "auto-skip verified, bk19-in-both-files, ensemble-leg headline "
+          "ordering and fold pooling spot-checked")
     return 0
 
 
@@ -756,15 +921,22 @@ def main(argv=None):
     results_dir = Path(a.results_dir)
     out_dir = results_dir / "summary_plots"
 
-    written = [plot_training_curves(results_dir, out_dir),
-               plot_csi_comparison(results_dir, out_dir),
-               plot_permutation_importance(results_dir, out_dir),
-               plot_ablation_ladder(results_dir, out_dir)]
+    written = [plot_training_curves(results_dir, out_dir)]
+    # Per-source figure families: one comparison + one permutation file per
+    # test source; a source with nothing pulled skips with a note.  The
+    # ablation ladder stays a single file -- its within-panel source
+    # contrast IS the figure.
+    for source in EXPECTED_SOURCES:
+        written.append(plot_csi_comparison(results_dir, out_dir, source))
+        written.append(plot_permutation_importance(results_dir, out_dir,
+                                                   source))
+    written.append(plot_ablation_ladder(results_dir, out_dir))
     if a.per_fold:
         folds = [a.fold] + ([1, 2] if a.all_folds and a.fold == 0 else [])
         for fold in dict.fromkeys(folds):       # dedupe, keep order
-            written.append(plot_csi_comparison_fold(results_dir, out_dir,
-                                                    fold))
+            for source in EXPECTED_SOURCES:
+                written.append(plot_csi_comparison_fold(
+                    results_dir, out_dir, fold, source))
 
     for path in filter(None, written):
         print(f"wrote {path}")

@@ -7,9 +7,18 @@ from one of three input sources:
 * ``reanalysis``  -- clean MERRA-2 surface fields (``dataset.year_arrays``),
 * ``kriged-airs`` -- kriged gap-filled AIRS-FCST fields
   (``dataset.kriged_year_arrays``; caches built by ``dl_front.krige_fill``),
-* ``bk19``        -- the PUBLISHED Biard & Kunkel (2019) DL-FRONT prediction
-  rasters (``config.BK19_DIR``; no checkpoint involved -- the files ARE the
-  model output, hard binary classes, no dryline).
+* ``bk19``        -- BK19-SCHEMA prediction rasters (no checkpoint involved
+  -- the files ARE the model output, hard binary classes).  By default the
+  PUBLISHED Biard & Kunkel (2019) archive (``config.BK19_DIR``; no dryline);
+  ``--pred-dir`` points the same leg at any other BK19-schema archive --
+  e.g. an ``export_predictions`` ensemble, front=6 with dryline kept --
+  and ``--leg-name`` renames its outputs so the published leg's ``bk19.csv``
+  is never overwritten (user decision 2026-08-21: user-facing evaluations
+  report the ENSEMBLE, not folds)::
+
+      python -m dl_front.evaluate_test --source bk19 \\
+          --pred-dir $JPL_AIRS_DATA/front_id/predicted_fronts/dlfront_D6C-ens3_kriged-airs \\
+          --leg-name D6C-ens3_kriged-airs --classes 6
 
 All legs are restricted to the SAME time steps, two ways:
 
@@ -37,7 +46,10 @@ Outputs under ``results/dl_front/test_eval/`` (created on demand):
 
 * ``<ckpt-stem>_<source>.csv``        tidy neighborhood-CSI table
                                       (front, dilation, km, csi, pod, far, fb)
-                                      (the bk19 leg's stem is just ``bk19``)
+                                      (the bk19 leg's stem is just ``bk19``,
+                                      or the ``--leg-name`` override; the
+                                      run json then records ``pred_dir`` +
+                                      ``leg`` so the stem stays attributable)
 * ``<ckpt-stem>_<source>_paper.json`` paper metrics: accuracy dict, ROC AUC,
                                       per-class confusion (% of masked cells).
                                       SKIPPED for bk19: hard binary
@@ -94,6 +106,8 @@ CLI::
         --source kriged-airs [--years 2016-2018] [--hours 18,21,0] \
         [--channels T2M,QV2M]
     python -m dl_front.evaluate_test --source bk19 --classes 6
+    python -m dl_front.evaluate_test --source bk19 --classes 6 \
+        --pred-dir <archive-root> --leg-name D6C-ens3_kriged-airs
     python -m dl_front.evaluate_test compare
     python -m dl_front.evaluate_test label-digest [--classes 6] \
         [--years 2016-2018]
@@ -149,16 +163,30 @@ def kriged_cache_times(year: int, source: str = "kriged-airs"
         return pd.DatetimeIndex(ds["time"].values)
 
 
-def bk19_path(year: int) -> Path:
-    """Path of one BK19 published-prediction file; actionable error if absent.
+def bk19_path(year: int, root: Path | None = None) -> Path:
+    """Path of one BK19-schema prediction file; actionable error if absent.
 
-    The published archive covers 1980-2018 (which is why the 6-class eval
+    ``root`` (the ``--pred-dir`` override, user decision 2026-08-21): an
+    ALTERNATE archive root holding BK19-schema files -- typically an
+    ``export_predictions`` archive of our own model (e.g. the
+    softmax-averaged ``dlfront_D6C-ens3_kriged-airs``), whose basenames are
+    deliberately byte-identical to BK19's so this one path builder serves
+    both.  ``None`` keeps the published Biard & Kunkel archive at
+    ``config.BK19_DIR`` (1980-2018 coverage, which is why the 6-class eval
     years are 2016-2018, user decision 2026-08-13).
     """
     w = config.LABEL_WIDTH
-    path = (config.BK19_DIR / f"1deg_{w}wide" / "3hr"
+    base = config.BK19_DIR if root is None else Path(root)
+    path = (base / f"1deg_{w}wide" / "3hr"
             / f"merra2_merra2-1deg_{w}wide_3hr_{year}.nc")
     if not path.exists():
+        if root is not None:
+            raise FileNotFoundError(
+                f"no prediction file for {year} in the --pred-dir archive: "
+                f"{path} does not exist; check the --pred-dir root (it must "
+                f"contain the BK19 layout 1deg_{w}wide/3hr/...), or export "
+                f"the year with 'python -m dl_front.export_predictions "
+                f"--years {year} ...'")
         raise FileNotFoundError(
             f"no BK19 published predictions for {year}: {path} does not "
             f"exist (the archive covers 1980-2018 only); the default "
@@ -190,9 +218,15 @@ def bk19_class_grid(bk, n_classes: int) -> np.ndarray:
     return cls
 
 
-def bk19_year_arrays(year: int, n_classes: int
+def bk19_year_arrays(year: int, n_classes: int, root: Path | None = None
                      ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
-    """One year of the BK19 leg: (pred-as-x, y, times).
+    """One year of a BK19-schema leg: (pred-as-x, y, times).
+
+    ``root``: alternate archive root (see :func:`bk19_path`).  An exported
+    archive carries front=6 (dryline kept), which flows through unchanged:
+    :func:`bk19_class_grid` matches ``front_type`` names against the
+    6-class list, so its dryline channel is painted and dryline rows appear
+    in the CSV, while the published 5-front files simply never paint it.
 
     "x" is the published prediction class grid carried as a trailing
     channel, (n, 68, 141, 1) -- :class:`BK19Predictions` one-hot encodes it
@@ -204,7 +238,7 @@ def bk19_year_arrays(year: int, n_classes: int
     """
     import xarray as xr
 
-    with xr.open_dataset(bk19_path(year)) as bk:
+    with xr.open_dataset(bk19_path(year, root)) as bk:
         bk = bk.load()
     pred = bk19_class_grid(bk, n_classes)
     bk_times = pd.DatetimeIndex(bk["time"].values)
@@ -240,16 +274,27 @@ class BK19Predictions:
         return probs
 
 
-def load_year(year: int, n_classes: int, stats: dict, source: str
+def load_year(year: int, n_classes: int, stats: dict, source: str,
+              pred_dir: Path | None = None
               ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
     """One year of (x, y, times) from the requested source.
+
+    ``pred_dir``: bk19-source archive-root override (see :func:`bk19_path`).
+    It is meaningless for any other source -- those read surface FIELDS,
+    not prediction rasters -- so passing it there raises rather than being
+    silently ignored (a caller who set it clearly expected it to matter).
 
     Raises FileNotFoundError naming the missing data AND the command that
     produces it, so a failed cluster run tells the operator exactly what to
     do next.
     """
+    if pred_dir is not None and source != "bk19":
+        raise ValueError(f"pred_dir only applies to source 'bk19' (an "
+                         f"archive of prediction rasters), not "
+                         f"{source!r} (which loads input fields)")
     if source == "bk19":
-        return bk19_year_arrays(year, n_classes)   # stats unused: no z-score
+        # stats unused: no z-scoring of hard class rasters
+        return bk19_year_arrays(year, n_classes, pred_dir)
 
     if source == "reanalysis":
         year_dir = config.SFC_DIR / str(year)
@@ -563,7 +608,8 @@ def evaluate_ckpt(model, years, n_classes: int, source: str,
                   hours=None, stats: dict | None = None,
                   loader=None, batch_size: int = 64,
                   match_source: str | None = None,
-                  info: dict | None = None
+                  info: dict | None = None,
+                  pred_dir: Path | None = None
                   ) -> tuple[evaluate.PaperMetrics, pd.DataFrame]:
     """Streamed test evaluation -> (PaperMetrics, pooled CSI scores).
 
@@ -580,6 +626,9 @@ def evaluate_ckpt(model, years, n_classes: int, source: str,
     reanalysis runs.
     ``info``: optional dict, filled with per-year step counts and a SHA-1 of
     every scored timestamp (comparability provenance).
+    ``pred_dir``: bk19-source archive-root override, threaded to
+    :func:`load_year` (score an exported archive instead of the published
+    BK19 files; user decision 2026-08-21).
 
     Scoring mask (user decision 2026-08-13): the 6-class dryline/AIRS
     track scores EVERY source -- reanalysis, kriged-airs AND bk19 -- over
@@ -591,7 +640,8 @@ def evaluate_ckpt(model, years, n_classes: int, source: str,
     if loader is None:
         if stats is None and source != "bk19":   # bk19 has no z-scoring
             stats = dataset.load_norm_stats()
-        loader = lambda year: load_year(year, n_classes, stats, source)
+        loader = lambda year: load_year(year, n_classes, stats, source,
+                                        pred_dir)
 
     mask = (dataset.analysis_domain() if n_classes == 6
             else dataset.region_mask().astype(bool))
@@ -669,18 +719,31 @@ def write_outputs(pm: evaluate.PaperMetrics, scores: pd.DataFrame,
                   ckpt: Path | None, source: str, years, hours,
                   out_dir: Path | None = None,
                   info: dict | None = None,
-                  write_paper: bool = True) -> dict:
+                  write_paper: bool = True,
+                  leg_name: str | None = None) -> dict:
     """Write the CSV + paper json + provenance json; return their paths.
 
     ``ckpt=None`` is the checkpoint-free bk19 leg: the stem is just the
     source name.  ``write_paper=False`` (bk19) skips the paper json -- hard
     binary predictions make the ROC none-scaling sweep meaningless -- and
     records that in the run json instead.
+
+    ``leg_name`` overrides the output stem outright (user decision
+    2026-08-21: user-facing evaluations report the ENSEMBLE, not folds).
+    Without it, a ``--pred-dir`` run of an exported archive would land on
+    the stem ``bk19`` and OVERWRITE the published-benchmark leg's CSVs --
+    the two legs share a source name precisely because they share a schema.
+    The caller (``main``) is responsible for pairing it with a ``pred_dir``
+    entry in ``info`` so the ``_run.json`` says which archive the numbers
+    belong to.
     """
     out_dir = Path(out_dir) if out_dir is not None \
         else config.RESULTS_DIR / "test_eval"
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = source if ckpt is None else f"{Path(ckpt).stem}_{source}"
+    if leg_name is not None:
+        stem = leg_name
+    else:
+        stem = source if ckpt is None else f"{Path(ckpt).stem}_{source}"
 
     tidy = scores.reset_index()[CSI_CSV_COLUMNS]
     csv_path = out_dir / f"{stem}.csv"
@@ -819,7 +882,9 @@ def pooled_leg_name(stem: str) -> tuple[str, int | None]:
     Fold pooling rule (user decision 2026-08-18): model legs are named
     ``<stage>-f<k>_<source>`` (e.g. ``D6C-f0_kriged-airs``); the pooled name
     strips the ``-f<k>`` (-> ``D6C_kriged-airs``).  A stem with no fold tag
-    (``bk19``) is its own one-member group and passes through unchanged.
+    (``bk19``, or an ensemble leg like ``D6C-ens3_kriged-airs`` -- the
+    ``-f`` is literal, so ``-ens3`` is NOT a fold tag) is its own one-member
+    group and passes through unchanged.
     """
     m = re.fullmatch(r"(.+)-f(\d+)_(.+)", stem)
     if m is None:
@@ -1029,6 +1094,18 @@ def main(argv=None):
                          "checkpoint's run_config.yaml, else the yaml "
                          "inputs.channels); a checkpoint whose channel "
                          "count disagrees is refused, never scored")
+    ap.add_argument("--pred-dir", default=None,
+                    help="bk19-source only: root of an ALTERNATE BK19-schema "
+                         "prediction archive to score (an export_predictions "
+                         "archive, e.g. the softmax-averaged ensemble under "
+                         "front_id/predicted_fronts/dlfront_D6C-ens3_"
+                         "kriged-airs); takes precedence over JPL_BK19_DIR / "
+                         "the config default for THIS run only")
+    ap.add_argument("--leg-name", default=None,
+                    help="bk19-source only: output stem for the CSV/_run.json"
+                         " (default 'bk19'); REQUIRED in practice with "
+                         "--pred-dir, otherwise the archive's numbers would "
+                         "overwrite the published-benchmark leg's files")
     ap.add_argument("--no-match", action="store_true",
                     help="do NOT intersect a reanalysis/bk19 run's time "
                          "steps with the kriged-airs cache (scores every "
@@ -1043,6 +1120,32 @@ def main(argv=None):
     if a.source == "bk19" and a.channels:
         ap.error("--channels does not apply to --source bk19 (its 'inputs' "
                  "are the published prediction rasters, not surface fields)")
+    if a.pred_dir and a.source != "bk19":
+        ap.error(f"--pred-dir only applies to --source bk19 (it names an "
+                 f"archive of PREDICTION rasters; --source {a.source} loads "
+                 f"input fields for a checkpoint)")
+    if a.leg_name and a.source != "bk19":
+        # model legs already carry identity in the checkpoint stem
+        ap.error(f"--leg-name only applies to --source bk19; a --source "
+                 f"{a.source} leg is named <ckpt-stem>_{a.source} "
+                 f"automatically")
+    if a.leg_name is not None and (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", a.leg_name)
+            or a.leg_name == "comparison"):
+        # the stem becomes filenames (<leg>.csv, <leg>_run.json) and a
+        # comparison.csv column header, so it must be a plain filesystem-safe
+        # stem; 'comparison' itself is the one stem compare() special-cases
+        ap.error(f"--leg-name {a.leg_name!r} is not a safe output stem: use "
+                 f"letters/digits/._- only (leading alphanumeric), and not "
+                 f"'comparison' (reserved for the compare subcommand)")
+    pred_dir = None
+    if a.pred_dir:
+        pred_dir = Path(a.pred_dir).resolve()
+        if not pred_dir.is_dir():
+            ap.error(f"--pred-dir {a.pred_dir} is not a directory; expected "
+                     f"an archive root containing "
+                     f"1deg_{config.LABEL_WIDTH}wide/3hr/ prediction files "
+                     f"(export_predictions layout)")
 
     years = resolve_years(a.years, a.classes)
     hours = (tuple(int(h) for h in a.hours.split(","))
@@ -1071,15 +1174,27 @@ def main(argv=None):
                   "labels_sha1": dataset.label_digest(years, a.classes),
                   "labels_dir": str(labels_dir(a.classes))}
     if is_bk19:
-        info["dryline"] = ("not predicted: the BK19 files carry no dryline "
-                           "class, so dryline CSV rows are all-miss by "
-                           "construction")
+        # Which archive was scored is invisible after the fact unless the
+        # run json carries it (the CSV schema is identical either way):
+        # record the RESOLVED root -- the --pred-dir override or the
+        # JPL_BK19_DIR/config default actually read -- plus the leg stem.
+        info["pred_dir"] = str(pred_dir if pred_dir is not None
+                               else Path(config.BK19_DIR).resolve())
+        info["leg"] = a.leg_name or "bk19"
+        if pred_dir is None:
+            # only the PUBLISHED archive is known dryline-less; an exported
+            # --pred-dir archive carries front=6 and its dryline rows are
+            # real predictions, so the disclaimer would be false there
+            info["dryline"] = ("not predicted: the BK19 files carry no "
+                               "dryline class, so dryline CSV rows are "
+                               "all-miss by construction")
     pm, scores = evaluate_ckpt(model, years, a.classes, a.source, hours,
-                               match_source=match_source, info=info)
+                               match_source=match_source, info=info,
+                               pred_dir=pred_dir)
     paths = write_outputs(pm, scores,
                           None if is_bk19 else Path(a.ckpt),
                           a.source, years, hours, info=info,
-                          write_paper=not is_bk19)
+                          write_paper=not is_bk19, leg_name=a.leg_name)
 
     acc = pm.accuracy()
     line = (f"\naccuracy: all={acc['all_categories']:.4f} "

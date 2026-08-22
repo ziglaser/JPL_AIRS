@@ -230,15 +230,22 @@ def test_missing_match_cache_fails_loudly(monkeypatch):
 # BK19 published-prediction leg (three-way test, user decision 2026-08-13)
 # --------------------------------------------------------------------------- #
 
-def make_bk19_ds(n_time=2, n_lat=6, n_lon=9):
+def make_bk19_ds(n_time=2, n_lat=6, n_lon=9, dryline=False):
     """Tiny synthetic BK19 benchmark dataset (schema of the real files,
-    with Capitalized front_type names to exercise case-insensitive match)."""
+    with Capitalized front_type names to exercise case-insensitive match).
+
+    ``dryline=True`` mimics an export_predictions archive instead: front=6
+    with a Dryline channel (the published files never carry one)."""
     xr = pytest.importorskip("xarray")
     types = ["Cold", "Warm", "Stationary", "Occluded", "None"]
+    if dryline:
+        types = types[:4] + ["Dryline"] + types[4:]
     fronts = np.zeros((n_time, len(types), n_lat, n_lon), dtype=np.float32)
     fronts[:, 0, 2, 1:4] = 1.0            # cold line
     fronts[:, 1, 2, 3] = 1.0              # warm OVERLAPS cold at (2, 3)
     fronts[:, 3, 4, 0:2] = 1.0            # occluded segment
+    if dryline:
+        fronts[:, 4, 1, 5:8] = 1.0        # dryline segment (exported only)
     times = pd.date_range("2016-06-01", periods=n_time, freq="3h")
     return xr.Dataset(
         {"fronts": (("time", "front", "lat", "lon"), fronts)},
@@ -260,6 +267,17 @@ def test_bk19_class_grid_painting():
     expected_front = np.zeros((6, 9), bool)
     expected_front[2, 1:4] = expected_front[4, 0:2] = True
     assert ((cls != NONE) == expected_front).all()  # none everywhere else
+
+
+def test_bk19_class_grid_paints_dryline_from_6front_archive():
+    """The exported (--pred-dir) archives carry front=6 with dryline kept;
+    the UNMODIFIED bk19 painter must paint it -- the 'score any archive
+    through the bk19 leg' claim depends on it (user decision 2026-08-21)."""
+    cls = evaluate_test.bk19_class_grid(make_bk19_ds(dryline=True), N_CLASSES)
+    names = config.CLASS_NAMES_6
+    assert (cls[:, 1, 5:8] == names.index("dryline")).all()
+    assert cls[0, 2, 1] == names.index("cold")       # 5-front behavior intact
+    assert cls[0, 2, 3] == names.index("warm")
 
 
 def test_bk19_missing_year_error_names_env_var(monkeypatch, tmp_path):
@@ -303,6 +321,166 @@ def test_bk19_outputs_skip_paper_json(tmp_path):
     assert run["ckpt"] is None
     assert run["paper_metrics"] == "skipped (binary baseline)"
     assert run["dryline"] == "not predicted"
+
+
+# --------------------------------------------------------------------------- #
+# --pred-dir / --leg-name: score an exported archive as a NAMED leg
+# (user decision 2026-08-21: user-facing evaluations report the ENSEMBLE)
+# --------------------------------------------------------------------------- #
+
+def make_scores():
+    """A minimal csi_scores-shaped frame: what write_outputs consumes."""
+    return pd.DataFrame(
+        {"dilation": [0], "csi": [0.5], "csi_lo": [0.4], "csi_hi": [0.6],
+         "pod": [0.5], "far": [0.1], "fb": [1.0]},
+        index=pd.MultiIndex.from_tuples([("cold", 0.0)],
+                                        names=["front", "km"]))
+
+
+class FakePM:
+    """Just enough PaperMetrics surface for a write_paper=False main run."""
+
+    def accuracy(self):
+        return {"all_categories": 1.0, "front_no_front": 1.0}
+
+
+def bk19_main_fixture(monkeypatch, tmp_path):
+    """Monkeypatch main's collaborators so a bk19-source run needs no data.
+
+    Returns (archive_dir, out_dir, seen): evaluate_ckpt is replaced by a
+    recorder (so the wiring of pred_dir through main is what's under test),
+    label provenance readers are stubbed, and RESULTS_DIR is redirected so
+    write_outputs lands in tmp_path/test_eval.
+    """
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    seen = {}
+
+    def fake_eval(model, years, n_classes, source, hours,
+                  match_source=None, info=None, pred_dir=None):
+        seen.update(source=source, pred_dir=pred_dir, years=list(years))
+        return FakePM(), make_scores()
+
+    monkeypatch.setattr(evaluate_test, "evaluate_ckpt", fake_eval)
+    monkeypatch.setattr(evaluate_test.dataset, "label_digest",
+                        lambda years, n: "d" * 40)
+    monkeypatch.setattr(evaluate_test, "labels_dir",
+                        lambda n: tmp_path / "labels")
+    monkeypatch.setattr(evaluate_test.config, "RESULTS_DIR", tmp_path)
+    return archive, tmp_path / "test_eval", seen
+
+
+def test_pred_dir_and_leg_name_write_named_leg(monkeypatch, tmp_path):
+    """--pred-dir + --leg-name: outputs land under <leg-name>.*, the run
+    json records the RESOLVED archive root + leg, and the published
+    benchmark's bk19.csv is NOT touched (the collision this flag exists to
+    prevent)."""
+    archive, out, seen = bk19_main_fixture(monkeypatch, tmp_path)
+    out.mkdir()
+    (out / "bk19.csv").write_text("sentinel: published leg\n")
+
+    evaluate_test.main(["--source", "bk19", "--classes", "6",
+                        "--years", "2016",
+                        "--pred-dir", str(archive),
+                        "--leg-name", "D6C-ens3_kriged-airs"])
+
+    assert seen["pred_dir"] == archive.resolve()   # threaded to the loader
+    assert (out / "D6C-ens3_kriged-airs.csv").exists()
+    assert not (out / "D6C-ens3_kriged-airs_paper.json").exists()  # bk19 skip
+    run = json.loads((out / "D6C-ens3_kriged-airs_run.json").read_text())
+    assert run["pred_dir"] == str(archive.resolve())
+    assert run["leg"] == "D6C-ens3_kriged-airs"
+    assert run["source"] == "bk19"
+    assert run["paper_metrics"] == "skipped (binary baseline)"
+    # the dryline-all-miss disclaimer is for the PUBLISHED archive only:
+    # an exported archive predicts dryline for real
+    assert "dryline" not in run
+    assert (out / "bk19.csv").read_text() == "sentinel: published leg\n"
+    assert not (out / "bk19_run.json").exists()
+
+
+def test_leg_name_default_unchanged(monkeypatch, tmp_path):
+    """A plain --source bk19 run still writes bk19.csv (frozen stem), with
+    the default archive root recorded and the dryline disclaimer intact."""
+    _, out, seen = bk19_main_fixture(monkeypatch, tmp_path)
+
+    evaluate_test.main(["--source", "bk19", "--classes", "6",
+                        "--years", "2016"])
+
+    assert seen["pred_dir"] is None                # default archive root
+    assert (out / "bk19.csv").exists()
+    run = json.loads((out / "bk19_run.json").read_text())
+    assert run["leg"] == "bk19"
+    assert run["pred_dir"] == str(config.BK19_DIR.resolve())
+    assert "no dryline" in run["dryline"] or "not predicted" in run["dryline"]
+
+
+def test_pred_dir_and_leg_name_flag_validation(monkeypatch, tmp_path):
+    """--pred-dir/--leg-name are bk19-only; leg names must be safe stems."""
+    archive, _, _ = bk19_main_fixture(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit):    # pred-dir with a model source
+        evaluate_test.main(["--source", "reanalysis", "--ckpt", "x.h5",
+                            "--pred-dir", str(archive)])
+    with pytest.raises(SystemExit):    # leg-name with a model source
+        evaluate_test.main(["--source", "kriged-airs", "--ckpt", "x.h5",
+                            "--leg-name", "foo"])
+    with pytest.raises(SystemExit):    # path separator in the stem
+        evaluate_test.main(["--source", "bk19", "--leg-name", "a/b"])
+    with pytest.raises(SystemExit):    # reserved for the compare subcommand
+        evaluate_test.main(["--source", "bk19", "--leg-name", "comparison"])
+    with pytest.raises(SystemExit):    # nonexistent archive root
+        evaluate_test.main(["--source", "bk19", "--leg-name", "ok",
+                            "--pred-dir", str(tmp_path / "nope")])
+
+
+def test_bk19_path_pred_dir_override(monkeypatch, tmp_path):
+    """bk19_path(root=...) reads the override, never config.BK19_DIR, and a
+    missing year names the --pred-dir fix instead of JPL_BK19_DIR."""
+    monkeypatch.setattr(config, "BK19_DIR", tmp_path / "published")
+    w = config.LABEL_WIDTH
+    f = (tmp_path / "arch" / f"1deg_{w}wide" / "3hr"
+         / f"merra2_merra2-1deg_{w}wide_3hr_2016.nc")
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"")
+    assert evaluate_test.bk19_path(2016, root=tmp_path / "arch") == f
+    with pytest.raises(FileNotFoundError, match="pred-dir"):
+        evaluate_test.bk19_path(2017, root=tmp_path / "arch")
+
+
+def test_load_year_rejects_pred_dir_for_model_sources(tmp_path):
+    """pred_dir means nothing for field-loading sources: raise, never
+    silently ignore an override the caller expected to matter."""
+    with pytest.raises(ValueError, match="pred_dir only applies"):
+        evaluate_test.load_year(2016, N_CLASSES, STATS, "reanalysis",
+                                pred_dir=tmp_path)
+
+
+def test_pooled_leg_name_ens_stem_passes_through():
+    """compare()'s fold regex needs a LITERAL -f<digits>_: an ensemble stem
+    like D6C-ens3_kriged-airs is its own pooled leg, never mistaken for a
+    fold of some 'D6C-ens3' group (contract for the ensemble leg,
+    user decision 2026-08-21)."""
+    assert evaluate_test.pooled_leg_name("D6C-ens3_kriged-airs") == \
+        ("D6C-ens3_kriged-airs", None)
+    assert evaluate_test.pooled_leg_name("bk19") == ("bk19", None)
+    assert evaluate_test.pooled_leg_name("D6C-f0_kriged-airs") == \
+        ("D6C_kriged-airs", 0)
+
+
+def test_write_outputs_leg_name_overrides_stem(tmp_path):
+    """Importable API: leg_name renames every artifact of a bk19-style
+    (ckpt=None) run without touching the default-stem files."""
+    (tmp_path / "bk19.csv").write_text("sentinel\n")
+    paths = evaluate_test.write_outputs(
+        FakePM(), make_scores(), ckpt=None, source="bk19", years=[2016],
+        hours=(21, 0), out_dir=tmp_path, write_paper=False,
+        info={"pred_dir": "/some/archive", "leg": "myleg"},
+        leg_name="myleg")
+    assert paths["csv"].name == "myleg.csv"
+    assert paths["run"].name == "myleg_run.json"
+    run = json.loads(paths["run"].read_text())
+    assert run["pred_dir"] == "/some/archive" and run["leg"] == "myleg"
+    assert (tmp_path / "bk19.csv").read_text() == "sentinel\n"
 
 
 # --------------------------------------------------------------------------- #

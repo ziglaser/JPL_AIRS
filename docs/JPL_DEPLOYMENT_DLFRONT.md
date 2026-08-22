@@ -705,7 +705,29 @@ Writes, per checkpoint **and** for the softmax-averaged ensemble,
 `dataset.analysis_domain()`, BK19-identical dims/attrs/dtypes except
 `front = 6` (dryline kept). Score any archive through the unmodified BK19
 leg: `JPL_BK19_DIR=<root>/<tag> python -m dl_front.evaluate_test --source
-bk19 --classes 6`. `--force` rewrites existing years; `--ensemble-only`
+bk19 --classes 6`.
+
+The ensemble archive gets its own **named eval leg** (user decision
+2026-08-21: user-facing evaluations report the ensemble, not per-fold
+splits) — same BK19-schema reader, but written to
+`test_eval/D6C-ens3_kriged-airs.csv` (+ `_run.json`) so `compare` pivots it
+into `comparison.csv` next to the fold-pooled legs:
+
+```bash
+PYTHONPATH=src python -m dl_front.evaluate_test --source bk19 \
+    --pred-dir "$JPL_AIRS_DATA/front_id/predicted_fronts/dlfront_D6C-ens3_kriged-airs" \
+    --leg-name D6C-ens3_kriged-airs --classes 6 --years 2016-2018
+```
+
+Fold-vs-ensemble distinction: the pooled `D6C_kriged-airs` column is a
+*recipe estimate* (mean over three retrainings of the same recipe), while
+the `D6C-ens3_kriged-airs` leg is the *deployed product's own score* — the
+softmax-averaged archive that actually ships is what gets reported to
+users. The leg is checkpoint-free like bk19 (no `ckpt_sha1` in its
+`_run.json`); `scripts/dlfront_full_sequence.sh` runs it (plus a `compare`
+rerun) automatically after the export wait, and `scripts/dlfront_analysis.sh`
+picks it up whenever the archive exists on disk. `--force` rewrites
+existing years; `--ensemble-only`
 suppresses the per-fold archives; `--class-scale warm=1.3` picks a non-default
 operating point and lands in the tag. Idempotent per year (done-marker =
 `.nc` **and** `_run.json`), and **exits 1 when an archive tag got no year at
@@ -765,9 +787,21 @@ What it runs, in dependency order (see `--help` for the full contract):
    `FOLDS`-driven: whatever finished training gets analyzed.
 2. **Eval legs + compare.** Every main checkpoint × `{reanalysis,
    kriged-airs}` through `dl_front.evaluate_test`, plus the checkpoint-free
-   BK19 leg, plus the final fold-pooled `compare` into `comparison.csv` —
+   BK19 leg, plus — when the exported ensemble archive
+   (`front_id/predicted_fronts/dlfront_D6C-ens3_kriged-airs/`, section 11a)
+   exists on disk — the `D6C-ens3_kriged-airs` ensemble leg
+   (`--source bk19 --pred-dir … --leg-name D6C-ens3_kriged-airs`), plus the
+   final fold-pooled `compare` into `comparison.csv` —
    all with the main chain's skip discipline (years/match_source/
-   `labels_sha1`/`ckpt_sha1`). Non-main checkpoints are evaluated too (no
+   `labels_sha1`/`ckpt_sha1`; the bk19 and ensemble legs are
+   checkpoint-free, so their predicates carry no `ckpt_sha1` clause). The
+   pooled `D6C_*` columns are *recipe estimates* (mean over folds); the
+   ensemble leg is the *deployed product's own score* and is what
+   user-facing evaluations report (user decision 2026-08-21). When the
+   archive is absent the script prints a note naming the section-11a export
+   command instead — it never exports predictions itself (export needs
+   checkpoints + the krige cache and its own sbatch). Non-main checkpoints
+   are evaluated too (no
    `--channels` flag needed: `evaluate_test` adopts each checkpoint's own
    `run_config.yaml` channel list) and their CSVs are moved into
    `ablation_eval/` exactly like the ablation chain's move step, so a

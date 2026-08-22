@@ -27,7 +27,20 @@
 #   Step 2  Eval legs [CPU]: every MAIN checkpoint x {--source reanalysis,
 #           --source kriged-airs} through dl_front.evaluate_test on
 #           EVAL_YEARS, plus the checkpoint-free BK19 published-prediction
-#           leg, plus a final `evaluate_test compare` pivoting the leg CSVs
+#           leg, plus -- when the exported D6C softmax-ENSEMBLE archive
+#           exists on disk (front_id/predicted_fronts/
+#           dlfront_D6C-ens3_kriged-airs/, runbook 11a) -- the
+#           D6C-ens3_kriged-airs ensemble leg (user decision 2026-08-21:
+#           user-facing evaluations report the ENSEMBLE, not per-fold
+#           splits; the pooled per-fold legs stay as recipe estimates).
+#           The ensemble leg is checkpoint-free exactly like bk19 (an
+#           exported archive has no checkpoint, so its skip predicate has
+#           no ckpt_sha1 clause).  When the archive is ABSENT the leg is
+#           skipped with a note naming the export command -- this script
+#           never exports predictions (export needs checkpoints + the
+#           krige cache and has its own sbatch: slurm/dlfront_export.
+#           sbatch, runbook 11a).  Finally a `evaluate_test compare`
+#           pivots the leg CSVs
 #           in test_eval/ into comparison.csv (fold-pooled: legs named
 #           <stage>-f<k>_<source> are averaged across folds into
 #           <stage>_<source> columns -- see evaluate_test.compare).
@@ -58,8 +71,9 @@
 #               equals the CURRENT front-label content digest (computed
 #               ONCE per invocation via `dl_front.evaluate_test
 #               label-digest`) AND its ckpt_sha1 equals the SHA-1 of the
-#               checkpoint .h5 currently on disk (bk19 has no checkpoint
-#               and skips that clause).  Main legs are checked in
+#               checkpoint .h5 currently on disk (bk19 and the exported
+#               ensemble leg have no checkpoint and skip that clause).
+#               Main legs are checked in
 #               test_eval/, non-main legs in ablation_eval/ (their true
 #               post-move home -- a leftover in test_eval/ means the move
 #               failed, not that the leg is done).
@@ -167,6 +181,14 @@ PERM_DIR=$JPL_AIRS_RESULTS/dl_front/permutation
 EVAL_DIR=$JPL_AIRS_RESULTS/dl_front/test_eval
 ABLATION_EVAL_DIR=$JPL_AIRS_RESULTS/dl_front/ablation_eval
 KRIGED_AIRS=$JPL_AIRS_DATA/front_id/kriged_airs_fcst
+# The exported D6C softmax-ensemble archive (runbook 11a; written by
+# dl_front.export_predictions in the BK19 on-disk schema).  ENS_LEG is the
+# eval-leg name its CSV lands under in test_eval/ -- the tag minus the
+# "dlfront_" prefix, matching export_predictions' naming so the archive and
+# its scores pair up by eye.
+ENS_TAG=dlfront_D6C-ens3_kriged-airs
+ENS_LEG=${ENS_TAG#dlfront_}
+ENS_PRED_DIR=$JPL_AIRS_DATA/front_id/predicted_fronts/$ENS_TAG
 # ONE timestamp per invocation (logs reorg 2026-08-21): shared by the
 # manifest filename and the per-run log dir, so a manifest can always be
 # paired with its logs by eye instead of matching two nearby date stamps.
@@ -442,6 +464,39 @@ move_to_ablation_dir() {  # move_to_ablation_dir <stem>
     done
 }
 
+# ens_archive_present: 0 iff the exported D6C softmax-ensemble archive has
+# at least one EVAL_YEARS year file on disk (per-year filename fixed by
+# export_predictions' BK19-schema layout).  "At least one" rather than "all"
+# deliberately: a partial archive should still be SCORED on what it has --
+# evaluate_test intersects its time axis with the label years anyway -- and
+# the archive's own _run.json is the record of what was exported.
+ens_archive_present() {
+    local first=${EVAL_YEARS%-*} last=${EVAL_YEARS#*-} y
+    for ((y = first; y <= last; y++)); do
+        if [ -e "$ENS_PRED_DIR/1deg_3wide/3hr/merra2_merra2-1deg_3wide_3hr_$y.nc" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+# ens_export_note: the archive-absent message, one place for both branches.
+# It NAMES the export command (runbook 11a) instead of running it: export
+# needs the D6C checkpoints + the kriged-airs cache and has its own sbatch
+# (GPU-optional inference) -- creating predictions is out of scope for an
+# analysis-only script, exactly like training and cache builds are.
+ens_export_note() {
+    note "ensemble eval leg $ENS_LEG SKIPPED: no $EVAL_YEARS year file" \
+         "under $ENS_PRED_DIR/1deg_3wide/3hr/.  This script never exports" \
+         "predictions (analysis only) -- produce the archive first" \
+         "(runbook 11a):" \
+         "sbatch slurm/dlfront_export.sbatch" \
+         "--ckpt \$JPL_AIRS_RESULTS/dl_front/models/D6C-f0/D6C-f0.h5" \
+         "--ckpt \$JPL_AIRS_RESULTS/dl_front/models/D6C-f1/D6C-f1.h5" \
+         "--ckpt \$JPL_AIRS_RESULTS/dl_front/models/D6C-f2/D6C-f2.h5" \
+         "--source kriged-airs --years 2016-2021"
+    record "eval-$ENS_LEG" archive-absent
+}
+
 # join non-empty job ids with ':' (skipped legs contribute nothing) --
 # identical helper to both sibling chains, copied deliberately (see header).
 join_deps() {
@@ -645,6 +700,28 @@ if [ "$HAVE_SLURM" = 1 ]; then
         EVAL_JIDS+=("$SUBMIT_JID")
     fi
 
+    # checkpoint-free D6C softmax-ENSEMBLE leg (user decision 2026-08-21:
+    # user-facing evaluations report the ensemble; the fold-pooled D6C legs
+    # above stay as recipe estimates).  The exported archive scores through
+    # evaluate_test's BK19-schema reader (--source bk19 --pred-dir), so the
+    # skip predicate is bk19's exactly -- years + match_source +
+    # labels_sha1, NO ckpt_sha1 clause (an exported archive has no
+    # checkpoint behind it).  Gated on the archive existing: absent means
+    # note-and-move-on, never export here (see ens_export_note).
+    if ens_archive_present; then
+        if skip_eval "$EVAL_DIR" "$ENS_LEG" bk19 ""; then
+            note "skip eval $ENS_LEG (matched CSV exists; FORCE=1 to rerun)"
+        else
+            submit "eval-$ENS_LEG" 0 "" slurm/dlfront_eval.sbatch \
+                   --source bk19 --pred-dir "$ENS_PRED_DIR" \
+                   --leg-name "$ENS_LEG" --classes "$CLASSES" \
+                   --years "$EVAL_YEARS"
+            EVAL_JIDS+=("$SUBMIT_JID")
+        fi
+    else
+        ens_export_note
+    fi
+
     # non-main checkpoints: eval, then move OUT of test_eval/ (see header).
     # No --channels: evaluate_test adopts the checkpoint's own
     # run_config.yaml channel list, the only correct list for a discovered
@@ -744,6 +821,23 @@ else
         run_local eval-bk19 dl_front.evaluate_test \
             --source bk19 --classes "$CLASSES" --years "$EVAL_YEARS"
         NEW_EVALS=$((NEW_EVALS + 1))
+    fi
+
+    # checkpoint-free D6C softmax-ENSEMBLE leg -- same contract as the SLURM
+    # branch above (user decision 2026-08-21: report the ensemble; bk19-style
+    # skip predicate, no ckpt_sha1; archive absent = note, never export).
+    if ens_archive_present; then
+        if skip_eval "$EVAL_DIR" "$ENS_LEG" bk19 ""; then
+            note "skip eval $ENS_LEG (matched CSV exists)"
+        else
+            run_local "eval-$ENS_LEG" dl_front.evaluate_test \
+                --source bk19 --pred-dir "$ENS_PRED_DIR" \
+                --leg-name "$ENS_LEG" --classes "$CLASSES" \
+                --years "$EVAL_YEARS"
+            NEW_EVALS=$((NEW_EVALS + 1))
+        fi
+    else
+        ens_export_note
     fi
 
     # non-main checkpoints: eval then move immediately (foreground: no

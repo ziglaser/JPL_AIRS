@@ -22,6 +22,18 @@
 #           so it is submitted with --gres=gpu:1 only when the GPU partition
 #           has an idle node RIGHT NOW -- otherwise it runs on CPU instead of
 #           queueing behind training jobs.  WAITs on the ensemble archive.
+#   (then)  ensemble eval leg + compare rerun (added 2026-08-21; user
+#           decision: user-facing evaluations report the ENSEMBLE, not
+#           per-fold splits).  The just-exported softmax-ensemble archive is
+#           scored as its own named leg through evaluate_test's BK19-schema
+#           reader (--source bk19 --pred-dir --leg-name
+#           D6C-ens3_kriged-airs, checkpoint-free), then `evaluate_test
+#           compare` reruns so comparison.csv includes it next to the
+#           fold-pooled recipe legs.  No afterok on the export job needed:
+#           the step-6 wait already blocked until the archive existed.
+#           Runs BEFORE step 7 (inject does not depend on it, but the
+#           sequence must finish with a complete comparison); on SLURM the
+#           two jobs drain with the ablation chain at the very end.
 #   Step 7  scripts/add_front_flags.py: inject the met-drawn (1w+3w) and
 #           predicted per-front-type binary flags into copies of the
 #           FCST_SMAP_MRMS year files (foreground -- pure xarray, minutes).
@@ -62,6 +74,10 @@
 #   EXPORT_TIMEOUT_H     step-6 wait budget, hours            (default 12)
 #   ABLATION_TIMEOUT_H   step-5 final wait budget, hours      (default 36)
 #   EXPORT_YEARS         export + inject span                 (default 2016-2021)
+#   EVAL_YEARS           ensemble-eval-leg span               (default 2016-2018,
+#                        the chains' fixed comparison span: the BK19 archive
+#                        ends 2018, so the compare needs identical years)
+#   CLASSES              ensemble-eval-leg class count        (default 6)
 #   FOLDS                fold list, matches the chains        (default "0 1 2")
 #   plus everything cluster_kickoff.sh / the chains read (JPL_AIRS_DATA,
 #   SBATCH_GPU_PARTITION, CONDA_PREFIX_ROOT, ...).
@@ -79,6 +95,12 @@ MAIN_TIMEOUT_H=${MAIN_TIMEOUT_H:-72}
 EXPORT_TIMEOUT_H=${EXPORT_TIMEOUT_H:-12}
 ABLATION_TIMEOUT_H=${ABLATION_TIMEOUT_H:-36}
 EXPORT_YEARS=${EXPORT_YEARS:-2016-2021}
+# the ensemble eval leg's span/classes match the chains' fixed comparison
+# settings (BK19 ends 2018), NOT the export span -- evaluate_test compare
+# refuses legs scored on different samples, so a 2016-2021 leg would poison
+# the very comparison this step exists to complete
+EVAL_YEARS=${EVAL_YEARS:-2016-2018}
+CLASSES=${CLASSES:-6}
 FOLDS=${FOLDS:-0 1 2}
 Y0=${EXPORT_YEARS%-*} Y1=${EXPORT_YEARS#*-}
 
@@ -247,6 +269,44 @@ fi
 wait_for "step6 export ($ENS_TAG $EXPORT_YEARS)" \
          "$EXPORT_TIMEOUT_H" "${EXPORT_JID:-}" "${EXPORT_TARGETS[@]}"
 
+# ---- step 6.5: ensemble eval leg + compare rerun --------------------------- #
+# User decision 2026-08-21: user-facing evaluations report the ENSEMBLE (the
+# deployed product), not per-fold splits -- the fold-pooled D6C legs the main
+# chain scored are recipe estimates; this leg is the shipped archive's own
+# score.  Checkpoint-free: the archive scores through evaluate_test's
+# BK19-schema reader (--source bk19 --pred-dir), so there is no ckpt behind
+# it and no afterok needed (the step-6 wait above already blocked until the
+# archive existed).  The compare rerun pivots it into comparison.csv next to
+# the recipe legs.  Kept BEFORE step 7: inject does not read it, but the
+# sequence must finish with a complete comparison.
+ENS_LEG=${ENS_TAG#dlfront_}
+ENS_EVAL_ARGS=(--source bk19
+               --pred-dir "$JPL_AIRS_DATA/front_id/predicted_fronts/$ENS_TAG"
+               --leg-name "$ENS_LEG" --classes "$CLASSES"
+               --years "$EVAL_YEARS")
+ENS_JIDS=""
+if [ "$HAVE_SLURM" = 1 ]; then
+    # CPU jobs (inference-free scoring): the eval .sbatch's own resources
+    # apply; compare afterok-chains on the eval so the pivot always sees the
+    # fresh leg CSV.  Both drain with the ablation chain at the very end.
+    JENSEVAL=$(sbatch --parsable --export=ALL \
+               --output="$LOG_DIR/eval_ens_%j.out" \
+               slurm/dlfront_eval.sbatch "${ENS_EVAL_ARGS[@]}")
+    JENSCMP=$(sbatch --parsable --export=ALL \
+              --output="$LOG_DIR/compare_ens_%j.out" \
+              --dependency="afterok:$JENSEVAL" \
+              slurm/dlfront_eval.sbatch compare)
+    ENS_JIDS=$JENSEVAL,$JENSCMP
+    log "step 6.5: ensemble eval leg -> job $JENSEVAL," \
+        "compare rerun -> job $JENSCMP (afterok)"
+else
+    log "step 6.5: no SLURM -> ensemble eval + compare in the foreground"
+    python -m dl_front.evaluate_test "${ENS_EVAL_ARGS[@]}" \
+        > "$LOG_DIR/eval_ens.log" 2>&1
+    python -m dl_front.evaluate_test compare \
+        > "$LOG_DIR/compare_ens.log" 2>&1
+fi
+
 # ---- step 7: inject flags into FCST_SMAP_MRMS ------------------------------ #
 # foreground: pure xarray/netCDF4, minutes of work.  --force: the out-dir is
 # derived data (copies of the primaries), so overwriting a previous run's
@@ -260,17 +320,34 @@ python scripts/add_front_flags.py --years "$EXPORT_YEARS" --label-source noaa \
     > "$LOG_DIR/inject.log" 2>&1
 log "step 7: done -> $JPL_AIRS_DATA/FCST_SMAP_MRMS_fronts"
 
-# ---- final: let the ablation chain drain ----------------------------------- #
-if [ -n "${ABL_JIDS:-}" ] && [ "$HAVE_SLURM" = 1 ]; then
-    log "waiting for the ablation chain to drain (jobs: $ABL_JIDS)"
+# ---- final: let the ablation chain + step-6.5 eval/compare drain ----------- #
+# One combined drain: the step-6.5 ensemble eval + compare jobs were
+# deliberately NOT waited on inline (step 7 does not read them), so they are
+# collected here with the ablation jobs before the sequence declares itself
+# complete.
+DRAIN_JIDS=${ABL_JIDS:-}
+[ -n "$ENS_JIDS" ] && DRAIN_JIDS="${DRAIN_JIDS:+$DRAIN_JIDS,}$ENS_JIDS"
+if [ -n "$DRAIN_JIDS" ] && [ "$HAVE_SLURM" = 1 ]; then
+    log "waiting for the ablation chain + ensemble eval/compare to drain" \
+        "(jobs: $DRAIN_JIDS)"
     deadline=$(( $(date +%s) + ABLATION_TIMEOUT_H * 3600 ))
-    while [ "$(squeue -h -j "$ABL_JIDS" 2>/dev/null | wc -l)" != 0 ]; do
+    while [ "$(squeue -h -j "$DRAIN_JIDS" 2>/dev/null | wc -l)" != 0 ]; do
         [ "$(date +%s)" -lt "$deadline" ] \
-            || die "ablation chain still running after ${ABLATION_TIMEOUT_H}h"
+            || die "ablation/ensemble-eval jobs still running after ${ABLATION_TIMEOUT_H}h"
         sleep "$POLL_SECS"
     done
 fi
+# A drained queue is not success: if the ensemble leg's CSV never appeared,
+# the eval job failed (and dependency-cancelled the compare rerun) and the
+# comparison this sequence promised is incomplete -- fail loudly, exactly
+# like every other wait in this script.  (The no-SLURM branch already ran
+# both foreground under set -e, so this check is a no-op there.)
+[ -e "$JPL_AIRS_RESULTS/dl_front/test_eval/$ENS_LEG.csv" ] \
+    || die "ensemble eval leg CSV missing" \
+           "($JPL_AIRS_RESULTS/dl_front/test_eval/$ENS_LEG.csv) --" \
+           "the step-6.5 eval failed; check $LOG_DIR and sacct"
 log "ablation artifacts:" \
     "$(ls "$JPL_AIRS_RESULTS"/dl_front/permutation/*.csv 2>/dev/null | wc -l) permutation CSVs," \
     "$(ls "$JPL_AIRS_RESULTS"/dl_front/ablation_eval/*.csv 2>/dev/null | wc -l) ladder eval CSVs"
-log "SEQUENCE COMPLETE: main chain + ablation + export + inject all done"
+log "SEQUENCE COMPLETE: main chain + ablation + export + ensemble eval" \
+    "+ inject all done"
